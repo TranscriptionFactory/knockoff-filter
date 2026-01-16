@@ -9,3 +9,4 @@
 *.so
 *.pdf
 *.html
+*.egg-info/
