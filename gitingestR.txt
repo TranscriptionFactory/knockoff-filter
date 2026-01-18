@@ -1,0 +1,2247 @@
+================================================
+FILE: R/knockoff/R/create_fixed.R
+================================================
+#' Fixed-X knockoffs
+#' 
+#' Creates fixed-X knockoff variables.
+#' 
+#' @param X normalized n-by-p matrix of original variables.(\eqn{n \geq p}).
+#' @param method either "equi" or "sdp" (default: "sdp").
+#' This determines the method that will be used to minimize the correlation between the original variables and the knockoffs.
+#' @param sigma the noise level, used to augment the data with extra rows if necessary (default: NULL).
+#' @param y vector of length n, containing the observed responses. 
+#' This is needed to estimate the noise level if the parameter \code{sigma} is not provided, 
+#' in case \eqn{p \leq n < 2p} (default: NULL).
+#' @param randomize whether the knockoffs are constructed deterministically or randomized (default: F).
+#' @return An object of class "knockoff.variables". This is a list 
+#'  containing at least the following components:
+#'  \item{X}{n-by-p matrix of original variables (possibly augmented or transformed).}
+#'  \item{Xk}{n-by-p matrix of knockoff variables.}
+#'  \item{y}{vector of observed responses (possibly augmented). }
+#' 
+#' @family create
+#' 
+#' @references 
+#'   Barber and Candes,
+#'   Controlling the false discovery rate via knockoffs. 
+#'   Ann. Statist. 43 (2015), no. 5, 2055--2085.
+#' 
+#' @details
+#' Fixed-X knockoffs assume a homoscedastic linear regression model for \eqn{Y|X}. Moreover, they only guarantee
+#' FDR control when used in combination with statistics satisfying the "sufficiency" property. 
+#' In particular, the default statistics based on the cross-validated lasso does not satisfy this 
+#' property and should not be used with fixed-X knockoffs.
+#' 
+#' @examples
+#' set.seed(2022)
+#' p=100; n=200; k=15
+#' X = matrix(rnorm(n*p),n)
+#' nonzero = sample(p, k)
+#' beta = 5.5 * (1:p %in% nonzero)
+#' y = X %*% beta + rnorm(n)
+#' 
+#' # Basic usage with default arguments
+#' result = knockoff.filter(X, y, knockoffs=create.fixed)
+#' print(result$selected)
+#' 
+#' # Advanced usage with custom arguments
+#' knockoffs = function(X) create.fixed(X, method='equi')
+#' result = knockoff.filter(X, y, knockoffs=knockoffs)
+#' print(result$selected) 
+#' 
+#' @export
+create.fixed <- function(X, method=c('sdp','equi'), sigma=NULL, y=NULL, randomize=F) {
+  method = match.arg(method)
+  
+  # Validate dimensions, if using fixed-X knockoffs
+  n = nrow(X); p = ncol(X)
+  if (n <= p)
+    stop('Input X must have dimensions n > p')
+  else if (n < 2*p) {
+    warning('Input X has dimensions p < n < 2p. ',
+            'Augmenting the model with extra rows.',immediate.=T)
+    X.svd = svd(X, nu=n, nv=0)
+    u2 = X.svd$u[,(p+1):n]
+    X = rbind(X, matrix(0, 2*p-n, p))
+    if( is.null(sigma) ) {
+      if( is.null(y) ) {
+        stop('Either the noise level "sigma" or the response variables "y" must
+             be provided in order to augment the data with extra rows.')
+      }
+      else{
+        sigma = sqrt(mean((t(u2) %*% y)^2)) # = sqrt(RSS/(n-p))
+      }
+    }
+    if (randomize)
+      y.extra = rnorm(2*p-n, sd=sigma)
+    else
+      y.extra = with_seed(0, rnorm(2*p-n, sd=sigma))
+    y = c(y, y.extra)
+  }
+  # Normalize X, if using fixed-X knockoffs
+  X = normc(X, center=F)
+  
+  Xk = switch(match.arg(method), 
+               "equi" = create_equicorrelated(X,randomize),
+               "sdp"  = create_sdp(X,randomize)
+              )
+  structure(list(X=X, Xk=Xk, y=y), class='knockoff.variables')
+}
+
+#' Create equicorrelated fixed-X knockoffs.
+#'  
+#' @rdname create_equicorrelated
+#' @keywords internal
+create_equicorrelated <- function(X, randomize) {
+  # Compute SVD and U_perp.
+  X.svd = decompose(X, randomize)
+  
+  # Set s = min(2 * smallest eigenvalue of X'X, 1), so that all the correlations
+  # have the same value 1-s.
+  if (any(X.svd$d <= 1e-5 * max(X.svd$d)))
+    stop(paste('Data matrix is rank deficient.',
+               'Equicorrelated knockoffs will have no power.'))
+  lambda_min = min(X.svd$d)^2
+  s = min(2*lambda_min, 1)
+  
+  # Construct the knockoff according to Equation 1.4.
+  s_diff = pmax(0, 2*s - (s/X.svd$d)^2) # can be negative due to numerical error
+  X_ko = (X.svd$u %*diag% (X.svd$d - s / X.svd$d) +
+          X.svd$u_perp %*diag% sqrt(s_diff)) %*% t(X.svd$v)
+}
+
+#' Create SDP fixed-X knockoffs.
+#'  
+#' @rdname create_sdp
+#' @keywords internal
+create_sdp <- function(X, randomize) {
+  # Compute SVD and U_perp.
+  X.svd = decompose(X, randomize)
+  
+  # Check for rank deficiency.
+  tol = 1e-5
+  d = X.svd$d
+  d_inv = 1 / d
+  d_zeros = d <= tol*max(d)
+  if (any(d_zeros)) {
+    warning(paste('Data matrix is rank deficient.',
+                  'Model is not identifiable, but proceeding with SDP knockoffs'),immediate.=T)
+    d_inv[d_zeros] = 0
+  }
+  
+  # Compute the Gram matrix and its (pseudo)inverse.
+  G = (X.svd$v %*diag% d^2) %*% t(X.svd$v)
+  G_inv = (X.svd$v %*diag% d_inv^2) %*% t(X.svd$v)
+  
+  # Optimize the parameter s of Equation 1.3 using SDP.
+  s = create.solve_sdp(G)
+  s[s <= tol] = 0
+  
+  # Construct the knockoff according to Equation 1.4:
+  C.svd = canonical_svd(2*diag(s) - (s %diag*% G_inv %*diag% s))
+  X_ko = X - (X %*% G_inv %*diag% s) + 
+    (X.svd$u_perp %*diag% sqrt(pmax(0, C.svd$d))) %*% t(C.svd$v)
+}
+
+
+#' Compute the SVD of X and construct an orthogonal matrix U_perp such that U_perp * U = 0.
+#'  
+#' @rdname decompose
+#' @keywords internal
+decompose <- function(X, randomize) {
+  n = nrow(X); p = ncol(X)
+  stopifnot(n >= 2*p)
+  
+  result = canonical_svd(X)
+  Q = qr.Q(qr(cbind(result$u, matrix(0,n,p))))
+  u_perp = Q[,(p+1):(2*p)]
+  if (randomize) {
+      Q = qr.Q(qr(rnorm_matrix(p,p)))
+      u_perp = u_perp %*% Q
+  }
+  result$u_perp = u_perp
+  result
+}
+
+
+================================================
+FILE: R/knockoff/R/create_gaussian.R
+================================================
+#' Model-X Gaussian knockoffs
+#' 
+#' Samples multivariate Gaussian model-X knockoff variables.
+#' 
+#' @param X n-by-p matrix of original variables.
+#' @param mu vector of length p, indicating the mean parameter of the Gaussian model for \eqn{X}.
+#' @param Sigma p-by-p covariance matrix for the Gaussian model of \eqn{X}.
+#' @param method either "equi", "sdp" or "asdp" (default: "asdp").
+#' This determines the method that will be used to minimize the correlation between the original variables and the knockoffs.
+#' @param diag_s vector of length p, containing the pre-computed covariances between the original 
+#' variables and the knockoffs. This will be computed according to \code{method}, if not supplied. 
+#' @return A n-by-p matrix of knockoff variables.
+#' 
+#' @family create
+#' 
+#' @references 
+#'   Candes et al., Panning for Gold: Model-free Knockoffs for High-dimensional Controlled Variable Selection,
+#'   arXiv:1610.02351 (2016).
+#'   \href{https://web.stanford.edu/group/candes/knockoffs/index.html}{https://web.stanford.edu/group/candes/knockoffs/index.html}
+#' 
+#' @examples
+#' set.seed(2022)
+#' p=200; n=100; k=15
+#' rho = 0.4
+#' mu = rep(0,p); Sigma = toeplitz(rho^(0:(p-1)))
+#' X = matrix(rnorm(n*p),n) %*% chol(Sigma)
+#' nonzero = sample(p, k)
+#' beta = 3.5 * (1:p %in% nonzero)
+#' y = X %*% beta + rnorm(n)
+#' 
+#' # Basic usage with default arguments
+#' knockoffs = function(X) create.gaussian(X, mu, Sigma)
+#' result = knockoff.filter(X, y, knockoffs=knockoffs)
+#' print(result$selected)
+#' 
+#' # Advanced usage with custom arguments
+#' knockoffs = function(X) create.gaussian(X, mu, Sigma, method='equi')
+#' result = knockoff.filter(X, y, knockoffs=knockoffs)
+#' print(result$selected)
+#' 
+#' @export
+create.gaussian <- function(X, mu, Sigma, method=c("asdp","sdp","equi"), diag_s=NULL) {
+  method = match.arg(method)
+  
+  # Do not use ASDP unless p>500
+  if ((nrow(Sigma)<=500) && method=="asdp") {
+    method="sdp"
+  }
+  
+  if (is.null(diag_s)) {
+    diag_s = diag(switch(match.arg(method),
+                    'equi' = create.solve_equi(Sigma),
+                    'sdp'  = create.solve_sdp(Sigma),
+                    'asdp' = create.solve_asdp(Sigma)))
+  }
+  if (is.null(dim(diag_s))) {
+    diag_s = diag(diag_s,length(diag_s))
+  }
+  
+  # If diag_s is zero, we can only generate trivial knockoffs.
+  if(all(diag_s==0)) {
+    warning("The conditional knockoff covariance matrix is not positive definite. Knockoffs will have no power.")
+    return(X)
+  }
+  
+  SigmaInv_s = solve(Sigma,diag_s)
+  mu_k = X - sweep(X,2,mu,"-") %*% SigmaInv_s
+  Sigma_k = 2*diag_s - diag_s %*% SigmaInv_s
+  X_k = mu_k + matrix(rnorm(ncol(X)*nrow(X)),nrow(X)) %*% chol(Sigma_k)
+}
+
+
+================================================
+FILE: R/knockoff/R/create_second_order.R
+================================================
+#' Second-order Gaussian knockoffs
+#' 
+#' This function samples second-order multivariate Gaussian knockoff variables.
+#' First, a multivariate Gaussian distribution is fitted to the observations of X.
+#' Then, Gaussian knockoffs are generated according to the estimated model.
+#' 
+#' @param X n-by-p matrix of original variables.
+#' @param method either "equi", "sdp" or "asdp" (default: "asdp").
+#' This determines the method that will be used to minimize the correlation between the original variables and the knockoffs.
+#' @param shrink whether to shrink the estimated covariance matrix (default: F).
+#' @return A n-by-p matrix of knockoff variables.
+#'  
+#' @family create
+#' 
+#' @details
+#' If the argument \code{shrink} is set to T, a James-Stein-type shrinkage estimator for
+#' the covariance matrix is used instead of the traditional maximum-likelihood estimate. This option
+#' requires the package \code{corpcor}. See \code{\link[corpcor]{cov.shrink}} for more details.
+#' 
+#' Even if the argument \code{shrink} is set to F, in the case that the estimated covariance 
+#' matrix is not positive-definite, this function will apply some shrinkage.
+#' 
+#' @references 
+#'   Candes et al., Panning for Gold: Model-free Knockoffs for High-dimensional Controlled Variable Selection,
+#'   arXiv:1610.02351 (2016).
+#'   \href{https://web.stanford.edu/group/candes/knockoffs/index.html}{https://web.stanford.edu/group/candes/knockoffs/index.html}
+#'   
+#' @examples
+#' set.seed(2022)
+#' p=200; n=100; k=15
+#' rho = 0.4
+#' Sigma = toeplitz(rho^(0:(p-1)))
+#' X = matrix(rnorm(n*p),n) %*% chol(Sigma)
+#' nonzero = sample(p, k)
+#' beta = 3.5 * (1:p %in% nonzero)
+#' y = X %*% beta + rnorm(n)
+#' 
+#' # Basic usage with default arguments
+#' result = knockoff.filter(X, y, knockoffs=create.second_order)
+#' print(result$selected)
+#' 
+#' # Advanced usage with custom arguments
+#' knockoffs = function(X) create.second_order(X, method='equi')
+#' result = knockoff.filter(X, y, knockoffs=knockoffs)
+#' print(result$selected)   
+#'   
+#' @export
+create.second_order <- function(X, method=c("asdp","equi","sdp"), shrink=F) {
+  method = match.arg(method)
+  
+  # Estimate the mean vectorand covariance matrix
+  mu = colMeans(X)
+  
+  # Estimate the covariance matrix
+  if(!shrink) {
+    Sigma = cov(X)
+    # Verify that the covariance matrix is positive-definite
+    if(!is_posdef(Sigma)) {
+      shrink=TRUE
+    }
+  }
+  if(shrink) {
+    if (!requireNamespace('corpcor', quietly=T))
+      stop('corpcor is not installed', call.=F)
+    Sigma = tryCatch({suppressWarnings(matrix(as.numeric(corpcor::cov.shrink(X,verbose=F)), nrow=ncol(X)))},
+                     warning = function(w){}, error = function(e) {
+                       stop("SVD failed in the shrinkage estimation of the covariance matrix. Try upgrading R to version >= 3.3.0")
+                     }, finally = {})
+  }
+
+  # Sample the Gaussian knockoffs
+  create.gaussian(X, mu, Sigma, method=method)
+}
+
+
+================================================
+FILE: R/knockoff/R/knockoff.R
+================================================
+#' knockoff: A package for controlled variable selection
+#'
+#' This package implements the Knockoff Filter, which is a powerful and versatile tool for 
+#' controlled variable selection.
+#' 
+#' @section Outline:
+#' The procedure is based on the contruction of artificial 'knockoff copies' of the variables 
+#' present in the given statistical model. Then, it selects those variables that are clearly better 
+#' than their corresponding knockoffs, based on some measure of variable importance.
+#' A wide range of statistics and machine learning tools can be exploited to estimate the 
+#' importance of each variable, while guaranteeing finite-sample control of the false
+#' discovery rate (FDR).
+#' 
+#' The Knockoff Filter controls the FDR in either of two statistical scenarios:
+#' \itemize{
+#'  \item{The "model-X" scenario: }{the response \eqn{Y} can depend on the variables \eqn{X=(X_1,\ldots,X_p)}
+#'  in an arbitrary and unknown fashion, but the distribution of \eqn{X} must be known. In thise case
+#'  there are no constraints on the dimensions \eqn{n} and \eqn{p} of the problem.}
+#'  \item{The "fixed-X" scenario: }{the response \eqn{Y} depends upon \eqn{X} through a 
+#'  homoscedastic Gaussian linear model and the problem is low-dimensional (\eqn{n \geq p}). 
+#'  In this case, no modeling assumptions on \eqn{X} are required. }
+#' }
+#' 
+#' For more information, see the website below and the accompanying paper.
+#' 
+#' \url{https://web.stanford.edu/group/candes/knockoffs/index.html}
+#' 
+#' @docType package
+#' @name knockoff
+NULL
+
+
+
+================================================
+FILE: R/knockoff/R/knockoff_filter.R
+================================================
+#' @docType package
+#' @name knockoff
+#' @import stats methods
+NULL
+
+#' The Knockoff Filter
+#' 
+#' This function runs the Knockoffs procedure from start to finish, selecting variables
+#' relevant for predicting the outcome of interest.
+#' 
+#' This function creates the knockoffs, computes the importance statistics, 
+#' and selects variables. 
+#' It is the main entry point for the knockoff package.
+#' 
+#' @param X n-by-p matrix or data frame of predictors.
+#' @param y response vector of length n.
+#' @param knockoffs method used to construct knockoffs for the \eqn{X} variables.
+#' It must be a function taking a n-by-p matrix as input and returning a n-by-p matrix of knockoff variables. 
+#' By default, approximate model-X Gaussian knockoffs are used.
+#' @param statistic statistics used to assess variable importance. By default, 
+#' a lasso statistic with cross-validation is used. See the Details section for more information.
+#' @param fdr target false discovery rate (default: 0.1).
+#' @param offset either 0 or 1 (default: 1). This is the offset used to compute the rejection threshold on the
+#' statistics. The value 1 yields a slightly more conservative procedure ("knockoffs+") that
+#' controls the false discovery rate (FDR) according to the usual definition, 
+#' while an offset of 0 controls a modified FDR.
+#'
+#' @return An object of class "knockoff.result". This object is a list 
+#'  containing at least the following components:
+#'  \item{X}{matrix of original variables}
+#'  \item{Xk}{matrix of knockoff variables}
+#'  \item{statistic}{computed test statistics}
+#'  \item{threshold}{computed selection threshold}
+#'  \item{selected}{named vector of selected variables}
+#'
+#' @details
+#' 
+#' The parameter \code{knockoffs} controls how knockoff variables are created.
+#' By default, the model-X scenario is assumed and a multivariate normal distribution 
+#' is fitted to the original variables \eqn{X}. The estimated mean vector and the covariance 
+#' matrix are used to generate second-order approximate Gaussian knockoffs.
+#' In general, the function \code{knockoffs} should take a n-by-p matrix of
+#' observed variables \eqn{X} as input and return a n-by-p matrix of knockoffs.
+#' Two default functions for creating knockoffs are provided with this package.
+#' 
+#' In the model-X scenario, under the assumption that the rows of \eqn{X} are distributed 
+#' as a multivariate Gaussian with known parameters, then the function 
+#' \code{create.gaussian} can be used to generate Gaussian knockoffs, 
+#' as shown in the examples below.
+#' 
+#' In the fixed-X scenario, one can create the knockoffs using the function 
+#' \code{create.fixed}. This requires \eqn{n \geq p} and it assumes 
+#' that the response \eqn{Y} follows a homoscedastic linear regression model.
+#' 
+#' For more information about creating knockoffs, type \code{??create}.
+#' 
+#' The default importance statistic is \link{stat.glmnet_coefdiff}.
+#' For a complete list of the statistics provided with this package, 
+#' type \code{??stat}.
+#' 
+#' It is possible to provide custom functions for the knockoff constructions 
+#' or the importance statistics. Some examples can be found in the vignette.
+#' 
+#' @references 
+#'   Candes et al., Panning for Gold: Model-free Knockoffs for High-dimensional Controlled Variable Selection,
+#'   arXiv:1610.02351 (2016).
+#'   \href{https://web.stanford.edu/group/candes/knockoffs/index.html}{https://web.stanford.edu/group/candes/knockoffs/index.html}
+#'   
+#'   Barber and Candes,
+#'   Controlling the false discovery rate via knockoffs. 
+#'   Ann. Statist. 43 (2015), no. 5, 2055--2085.
+#' 
+#' @examples
+#' set.seed(2022)
+#' p=200; n=100; k=15
+#' mu = rep(0,p); Sigma = diag(p)
+#' X = matrix(rnorm(n*p),n)
+#' nonzero = sample(p, k)
+#' beta = 3.5 * (1:p %in% nonzero)
+#' y = X %*% beta + rnorm(n)
+#' 
+#' # Basic usage with default arguments
+#' result = knockoff.filter(X, y)
+#' print(result$selected)
+#' 
+#' # Advanced usage with custom arguments
+#' knockoffs = function(X) create.gaussian(X, mu, Sigma)
+#' k_stat = function(X, Xk, y) stat.glmnet_coefdiff(X, Xk, y, nfolds=5)
+#' result = knockoff.filter(X, y, knockoffs=knockoffs, statistic=k_stat)
+#' print(result$selected)
+#' 
+#' 
+#' @export
+knockoff.filter <- function(X, y,
+                              knockoffs=create.second_order,
+                              statistic=stat.glmnet_coefdiff, 
+                              fdr=0.10,
+                              offset=1
+                              ) {
+  
+  # Validate input types.
+  if (is.data.frame(X)) {
+    X.names = names(X)
+    X = as.matrix(X, rownames.force = F)  
+  } else if (is.matrix(X)) {
+    X.names = colnames(X)
+  } else {
+    stop('Input X must be a numeric matrix or data frame')
+  }
+  if (!is.numeric(X)) stop('Input X must be a numeric matrix or data frame')
+  
+  if (!is.factor(y) && !is.numeric(y)) {
+    stop('Input y must be either of numeric or factor type')
+  }
+  if( is.numeric(y) ) y = as.vector(y)
+  
+  if(offset!=1 && offset!=0) {
+    stop('Input offset must be either 0 or 1')
+  }
+  
+  if (!is.function(knockoffs)) stop('Input knockoffs must be a function')
+  if (!is.function(statistic)) stop('Input statistic must be a function')
+  
+  # Validate input dimensions
+  n = nrow(X); p = ncol(X)
+  stopifnot(length(y) == n)
+
+  # If fixed-design knockoffs are being used, provive them with the response vector
+  # in order to augment the data with new rows if necessary
+  if( identical(knockoffs, create.fixed) )
+    knockoffs = function(x) create.fixed(x, y=y)
+  
+  # Create knockoff variables
+  knock_variables = knockoffs(X)
+  
+  # If fixed-design knockoffs are being used, update X and Y with the augmented observations (if present)
+  if (is(knock_variables,"knockoff.variables")){
+    X  = knock_variables$X
+    Xk = knock_variables$Xk
+    if(!is.null(knock_variables$y)) y  = knock_variables$y
+    rm(knock_variables)
+  } else if (is(knock_variables,"matrix")){
+    Xk = knock_variables
+    rm(knock_variables)
+  } else {
+    stop('Knockoff variables of incorrect type')
+  }
+  
+  # Compute statistics
+  W = statistic(X, Xk, y)
+  
+  # Run the knockoff filter
+  t = knockoff.threshold(W, fdr=fdr, offset=offset)
+  selected = sort(which(W >= t))
+  if (!is.null(X.names))
+    names(selected) = X.names[selected]
+  
+  # Package up the results.
+  structure(list(call = match.call(),
+                 X = X,
+                 Xk = Xk,
+                 y = y,
+                 statistic = W,
+                 threshold = t,
+                 selected = selected),
+            class = 'knockoff.result')
+}
+
+#' Threshold for the knockoff filter
+#' 
+#' Computes the threshold for the knockoff filter.
+#' 
+#' @param W the test statistics
+#' @param fdr target false discovery rate (default: 0.1)
+#' @param offset either 0 or 1 (default: 1). The offset used to compute the rejection threshold on the
+#' statistics. The value 1 yields a slightly more conservative procedure ("knockoffs+") that
+#' controls the FDR according to the usual definition, while an offset of 0 controls a modified FDR.
+#' @return The threshold for variable selection.
+#' 
+#' @export
+knockoff.threshold <- function(W, fdr=0.10, offset=1) {
+  if(offset!=1 && offset!=0) {
+    stop('Input offset must be either 0 or 1')
+  }
+  ts = sort(c(0, abs(W)))
+  ratio = sapply(ts, function(t)
+    (offset + sum(W <= -t)) / max(1, sum(W >= t)))
+  ok = which(ratio <= fdr)
+  ifelse(length(ok) > 0, ts[ok[1]], Inf)
+}
+
+#' Print results for the knockoff filter
+#' 
+#' Prints the list of variables selected by the knockoff filter and the corresponding function call.
+#' 
+#' @param x the output of a call to knockoff.filter
+#' @param ... unused
+#' 
+#' @method print knockoff.result
+#' @export
+print.knockoff.result <- function(x, ...) {
+  cat('Call:\n')
+  print(x$call)
+  cat('\nSelected variables:\n')
+  print(x$selected)
+}
+
+#' Verify dependencies for chosen statistics
+#' 
+#' @param statistic the statistic chosen by the user
+#' 
+#' @keywords internal
+verify_stat_depends <- function(statistic) {
+  
+}
+
+
+================================================
+FILE: R/knockoff/R/solve_asdp.R
+================================================
+#' Relaxed optimization for fixed-X and Gaussian knockoffs
+#'
+#' This function solves the optimization problem needed to create fixed-X and Gaussian SDP knockoffs
+#' on a block-diagonal approximation of the covariance matrix. This will be less
+#' powerful than \code{\link{create.solve_sdp}}, but more computationally efficient.
+#' 
+#' @param Sigma positive-definite p-by-p covariance matrix.
+#' @param max.size size of the largest block in the block-diagonal approximation of Sigma (default: 500). See Details.
+#' @param maxit the maximum number of iterations for the solver (default: 1000).
+#' @param gaptol tolerance for duality gap as a fraction of the value of the objective functions (default: 1e-6).
+#' @param verbose whether to display progress (default: FALSE).
+#' @return The solution \eqn{s} to the semidefinite program defined above.
+#'
+#' @details Solves the following two-step semidefinite program:
+#'
+#'   (step 1)  \deqn{ \mathrm{maximize}     \; \mathrm{sum}(s) \quad
+#'                    \mathrm{subject} \; \mathrm{to:}  \; 0 \leq s \leq 1, \;
+#'                                          2 \Sigma_{\mathrm{approx}} - \mathrm{diag}(s) \geq 0}
+#'                              
+#'   (step 2) \deqn{ \mathrm{maximize}      \; \gamma \quad
+#'                   \mathrm{subject} \; \mathrm{to:}    \; \mathrm{diag}(\gamma s) \leq 2 \Sigma}
+#'
+#' Each smaller SDP is solved using the interior-point method implemented in \code{\link[Rdsdp]{dsdp}}.
+#' 
+#' The parameter max.size controls the size of the largest semidefinite program that needs to be solved.
+#' A larger value of max.size will increase the computation cost, while yielding a solution closer to
+#' that of the original semidefinite program.
+#'
+#' If the matrix Sigma supplied by the user is a non-scaled covariance matrix 
+#' (i.e. its diagonal entries are not all equal to 1), then the appropriate scaling is applied before
+#' solving the SDP defined above. The result is then scaled back before being returned, as to match 
+#' the original scaling of the covariance matrix supplied by the user.
+#' 
+#' @family optimization
+#' 
+#' @export
+create.solve_asdp <- function(Sigma, max.size=500, gaptol=1e-6, maxit=1000, verbose=FALSE) {
+  # Check that covariance matrix is symmetric
+  stopifnot(isSymmetric(Sigma))
+  
+  if(ncol(Sigma) <= max.size) return(create.solve_sdp(Sigma, gaptol=gaptol, maxit=maxit, verbose=verbose))
+  
+  # Approximate the covariance matrix as block diagonal
+  if(verbose) cat(sprintf("Dividing the problem into subproblems of size <= %s ... ", max.size))
+  cluster_sol = divide.sdp(Sigma, max.size=max.size)
+  n.blocks = max(cluster_sol$clusters)
+  if(verbose) cat("done. \n")
+  
+  # Solve the smaller SDPs corresponding to each block
+  if(verbose) cat(sprintf("Solving %s smaller SDPs ... \n", n.blocks))
+  s_asdp_list = list()
+  if(verbose) pb <- utils::txtProgressBar(min = 0, max = n.blocks, style = 3)
+  for(k in 1:n.blocks) {
+    s_asdp_list[[k]] = create.solve_sdp(as.matrix(cluster_sol$subSigma[[k]]), gaptol=gaptol, maxit=maxit)
+    if(verbose) utils::setTxtProgressBar(pb, k)
+  }
+  if(verbose) cat("\n")
+  
+  # Assemble the solutions into one vector of length p
+  p = dim(Sigma)[1]
+  idx_count = rep(1, n.blocks)
+  s_asdp = rep(0,p)
+  for( j in 1:p ){
+    cluster_j = cluster_sol$clusters[j]
+    s_asdp[j] = s_asdp_list[[cluster_j]][idx_count[cluster_j]]
+    idx_count[cluster_j] = idx_count[cluster_j]+1
+  }
+  
+  # Maximize the shrinkage factor
+  if(verbose) cat(sprintf("Combinining the solutions of the %s smaller SDPs ... ", n.blocks))
+  tol = 1e-12
+  maxitr=100000
+  gamma_range = seq(0,1,len=1000)
+  options(warn=-1)
+  gamma_opt = gtools::binsearch( function(i) {
+    G = 2*Sigma - gamma_range[i]*diag(s_asdp)
+    lambda_min = RSpectra::eigs(G, 1, which = "SR", opts = list(retvec = FALSE, maxitr=maxitr, tol=tol))$values
+    if (length(lambda_min)==0) {
+      lambda_min = 1  # Not converged
+    }
+    lambda_min
+  }, range=c(1,length(gamma_range)) )
+  s_asdp_scaled = gamma_range[min(gamma_opt$where)]*s_asdp
+  options(warn=0)
+  if(verbose) cat("done. \n")
+  
+  if(verbose) cat("Verifying that the solution is correct ... ")
+  # Verify that the solution is correct
+  if (!is_posdef(2*Sigma-diag(s_asdp_scaled,length(s_asdp_scaled)))) {
+    warning('In creation of approximate SDP knockoffs, procedure failed. Knockoffs will have no power.',immediate.=T)
+    s_asdp_scaled = 0*s_asdp_scaled
+  }
+  if(verbose) cat("done. \n")
+  
+  # Return result
+  s_asdp_scaled
+}
+
+#' Merge consecutive clusters of correlated variables while ensuring 
+#' that no cluster has size larger than max.size
+#'  
+#' @rdname merge.clusters
+#' @keywords internal
+merge.clusters <- function(clusters, max.size) {
+  cluster.sizes = table(clusters)
+  clusters.new = rep(0, length(clusters))
+  g = 1
+  g.size = 0
+  for(k in 1:max(clusters)) {
+    if(g.size + cluster.sizes[k] > max.size) {
+      g = g + 1
+      g.size = 0
+    }
+    clusters.new[clusters==k] = g
+    g.size = g.size + cluster.sizes[k]
+  }
+  return(clusters.new)
+}
+
+#' Approximate a covariance matrix by a block diagonal matrix with blocks
+#' of approximately equal size using Ward's method for hierarchical clustering
+#'  
+#' @rdname divide.sdp
+#' @keywords internal
+divide.sdp <- function(Sigma, max.size) {
+  # Convert the covariance matrix into a dissimilarity matrix
+  # Add a small perturbation to stabilize the clustering in the case of highly symmetrical matrices
+  p = ncol(Sigma)
+  Eps = matrix(rnorm(p*p),p)*1e-6
+  dissimilarity = 1 - abs(cov2cor(Sigma)+Eps)
+  distance = as.dist(dissimilarity)
+  
+  # Hierarchical clustering
+  fit = hclust(distance, method="single")
+  # Cut tree into clusters of size smaller than a threshold
+  n.blocks.min = 1
+  n.blocks.max = ncol(Sigma)
+  for(it in 1:100) {
+    n.blocks = ceiling((n.blocks.min+n.blocks.max)/2)
+    clusters = cutree(fit, k=n.blocks)
+    size = max(table(clusters))
+    if(size <= max.size) {
+      n.blocks.max = n.blocks
+    }
+    if(size >= max.size) {
+      n.blocks.min = n.blocks
+    }
+    if(n.blocks.min == n.blocks.max) {
+      break
+    }
+  }
+  
+  # Merge small clusters    
+  clusters.new = merge.clusters(clusters, max.size)
+  while(sum(clusters.new != clusters)>0) {
+    clusters = clusters.new
+    clusters.new = merge.clusters(clusters, max.size)
+  }
+  clusters = clusters.new
+  
+  # Create covariance submatrices for each cluster
+  subSigma = vector("list", max(clusters)) 
+  for( k in 1:length(subSigma) ) {
+    indices_k = clusters==k
+    subSigma[[k]] = Sigma[indices_k,indices_k]
+  }
+  
+  # Return the cluster assignments and the cluster covariance submatrices
+  structure(list(clusters=clusters, subSigma=subSigma), class='knockoff.clusteredCovariance')
+}
+
+
+================================================
+FILE: R/knockoff/R/solve_equi.R
+================================================
+#' Optimization for equi-correlated fixed-X and Gaussian knockoffs
+#' 
+#' This function solves a very simple optimization problem needed to create fixed-X and 
+#' Gaussian SDP knockoffs on the full the covariance matrix. This may be significantly
+#' less powerful than \code{\link{create.solve_sdp}}.
+#' 
+#' @param Sigma positive-definite p-by-p covariance matrix.
+#' @return The solution \eqn{s} to the optimization problem defined above.
+#' 
+#' @details Computes the closed-form solution to the semidefinite programming problem:
+#'  \deqn{ \mathrm{maximize}  \; s \quad
+#'        \mathrm{subject} \; \mathrm{to:}   \; 0 \leq s \leq 1, \;
+#'        2\Sigma - sI \geq 0 }
+#' used to generate equi-correlated knockoffs.
+#' 
+#' The closed form-solution to this problem is \eqn{s = 2\lambda_{\mathrm{min}}(\Sigma) \land 1}.
+#' 
+#' @family optimization
+#' 
+#' @export
+create.solve_equi <- function(Sigma) {
+  # Check that covariance matrix is symmetric
+  stopifnot(isSymmetric(Sigma))
+  p = nrow(Sigma)
+  tol = 1e-10
+  # Convert the covariance matrix to a correlation matrix
+  G = cov2cor(Sigma)
+  
+  # Check that the input matrix is positive-definite
+  if (!is_posdef(G)) {
+    stop('The covariance matrix is not positive-definite: cannot solve SDP',immediate.=T)
+  }
+  
+  if (p>2) {
+    converged=FALSE
+    maxitr=10000
+    while (!converged) {
+      lambda_min = RSpectra::eigs(G, 1, which="SR", opts=list(retvec = FALSE, maxitr=100000, tol=1e-8))$values
+      if (length(lambda_min)==1) {
+        converged = TRUE
+      } else {
+        if (maxitr>1e8) {
+          warning('In creation of equi-correlated knockoffs, while computing the smallest eigenvalue of the 
+                covariance matrix. RSpectra::eigs did not converge. Giving up and computing full SVD with built-in R function.',immediate.=T)
+          lambda_min = eigen(G, symmetric=T, only.values = T)$values[p]
+          converged=TRUE
+        } else {
+          warning('In creation of equi-correlated knockoffs, while computing the smallest eigenvalue of the 
+                covariance matrix. RSpectra::eigs did not converge. Trying again with increased number of iterations.',immediate.=T)
+          maxitr = maxitr*10
+        }
+      }
+    }
+  } else {
+    lambda_min = eigen(G, symmetric=T, only.values = T)$values[p]
+  }
+  
+  if (lambda_min<0) {
+    stop('In creation of equi-correlated knockoffs, while computing the smallest eigenvalue of the 
+                covariance matrix. The covariance matrix is not positive-definite.')
+  }
+  
+  s = rep(1, nrow(Sigma)) * min(2*lambda_min, 1)
+  
+  # Compensate for numerical errors (feasibility)
+  psd = 0;
+  s_eps = 1e-8;
+  while (psd==0) {
+    psd = is_posdef(2*G-diag(s*(1-s_eps),length(s)))
+    if (!psd) {
+      s_eps = s_eps*10
+    }
+  }
+  s = s*(1-s_eps)
+  
+  # Scale back the results for a covariance matrix
+  return(s*diag(Sigma))
+}
+
+
+================================================
+FILE: R/knockoff/R/solve_sdp.R
+================================================
+#' Optimization for fixed-X and Gaussian knockoffs
+#'
+#' This function solves the optimization problem needed to create fixed-X and Gaussian SDP knockoffs
+#' on the full covariance matrix. This will be more powerful than \code{\link{create.solve_asdp}},
+#' but more computationally expensive.
+#' 
+#' @param Sigma positive-definite p-by-p covariance matrix.
+#' @param maxit maximum number of iterations for the solver (default: 1000).
+#' @param gaptol tolerance for duality gap as a fraction of the value of the objective functions (default: 1e-6).
+#' @param verbose whether to display progress (default: FALSE).
+#' @return The solution \eqn{s} to the semidefinite programming problem defined above.
+#'
+#' @details
+#' Solves the semidefinite programming problem:
+#'
+#'   \deqn{ \mathrm{maximize}      \; \mathrm{sum}(s) \quad
+#'           \mathrm{subject} \; \mathrm{to}    0 \leq s \leq 1, \;
+#'                                  2\Sigma - \mathrm{diag}(s) \geq 0}
+#' 
+#' This problem is solved using the interior-point method implemented in \code{\link[Rdsdp]{dsdp}}.
+#'
+#' If the matrix Sigma supplied by the user is a non-scaled covariance matrix 
+#' (i.e. its diagonal entries are not all equal to 1), then the appropriate scaling is applied before
+#' solving the SDP defined above. The result is then scaled back before being returned, as to match 
+#' the original scaling of the covariance matrix supplied by the user.
+#' 
+#' @family optimization
+#' 
+#' @export
+create.solve_sdp <- function(Sigma, gaptol=1e-6, maxit=1000, verbose=FALSE) {
+  # Check that covariance matrix is symmetric
+  stopifnot(isSymmetric(Sigma))
+  # Convert the covariance matrix to a correlation matrix
+  G = cov2cor(Sigma)
+  p = dim(G)[1]
+  
+  # Check that the input matrix is positive-definite
+  if (!is_posdef(G)) {
+    warning('The covariance matrix is not positive-definite: knockoffs may not have power.', immediate.=T)
+  }
+  
+  # Convert problem for SCS
+  
+  # Linear constraints
+  Cl1 = rep(0,p)
+  Al1 = -Matrix::Diagonal(p)
+  Cl2 = rep(1,p)
+  Al2 = Matrix::Diagonal(p)
+  
+  # Positive-definite cone
+  d_As = c(diag(p))
+  As = Matrix::Diagonal(length(d_As), x=d_As)
+  As = As[which(Matrix::rowSums(As) > 0),] 
+  Cs = c(2*G)
+  
+  # Assemble constraints and cones
+  A = cbind(Al1,Al2,As)
+  C = matrix(c(Cl1,Cl2,Cs),1)
+  K=NULL
+  K$s=p
+  K$l=2*p
+  
+  # Objective
+  b = rep(1,p)
+  
+  # Solve SDP with Rdsdp
+  OPTIONS=NULL
+  OPTIONS$gaptol=gaptol
+  OPTIONS$maxit=maxit
+  OPTIONS$logsummary=0
+  OPTIONS$outputstats=0
+  OPTIONS$print=0
+  if(verbose) cat("Solving SDP ... ")
+  sol = Rdsdp::dsdp(A,b,C,K,OPTIONS)
+  if(verbose) cat("done. \n")
+  
+  # Check whether the solution is feasible
+  if( ! identical(sol$STATS$stype,"PDFeasible")) {
+    warning('The SDP solver returned a non-feasible solution. Knockoffs may lose power.')
+  }
+  
+  # Clip solution to correct numerical errors (domain)
+  s = sol$y
+  s[s<0]=0
+  s[s>1]=1
+  
+  # Compensate for numerical errors (feasibility)
+  if(verbose) cat("Verifying that the solution is correct ... ")
+  psd = 0
+  s_eps = 1e-8
+  while ((psd==0) & (s_eps<=0.1)) {
+    if (is_posdef(2*G-diag(s*(1-s_eps),length(s)),tol=1e-9)) {
+      psd  = 1
+    }
+    else {
+      s_eps = s_eps*10
+    }
+  }
+  s = s*(1-s_eps)
+  s[s<0]=0
+  if(verbose) cat("done. \n")
+  
+  # Verify that the solution is correct
+  if (all(s==0)) {
+    warning('In creation of SDP knockoffs, procedure failed. Knockoffs will have no power.',immediate.=T)
+  }
+  
+  # Scale back the results for a covariance matrix
+  return(s*diag(Sigma))
+}
+
+#' Vectorize a matrix into the SCS format
+#'  
+#' @rdname vectorize_matrix
+#' @keywords internal
+create.vectorize_matrix = function(M) {
+  # Scale the off-diagonal entries by sqrt(2)
+  vectorized_matrix = M
+  vectorized_matrix[lower.tri(M,diag=FALSE)] = M[lower.tri(M,diag=FALSE)] * sqrt(2)
+  # Stack the lower triangular elements column-wise
+  vectorized_matrix = vectorized_matrix[lower.tri(vectorized_matrix,diag=TRUE)]
+}
+
+
+================================================
+FILE: R/knockoff/R/stats_forward_selection.R
+================================================
+#' Importance statistics based on forward selection
+#' 
+#' Computes the statistic
+#'   \deqn{W_j = \max(Z_j, Z_{j+p}) \cdot \mathrm{sgn}(Z_j - Z_{j+p}),}
+#' where \eqn{Z_1,\dots,Z_{2p}} give the reverse order in which the 2p
+#' variables (the originals and the knockoffs) enter the forward selection 
+#' model.
+#' See the Details for information about forward selection.
+#' 
+#' In \emph{forward selection}, the variables are chosen iteratively to maximize
+#' the inner product with the residual from the previous step. The initial
+#' residual is always \code{y}. In standard forward selection
+#' (\code{stat.forward_selection}), the next residual is the remainder after
+#' regressing on the selected variable; when orthogonal matching pursuit
+#' is used, the next residual is the remainder
+#' after regressing on \emph{all} the previously selected variables.
+#' 
+#' @param X    n-by-p matrix of original variables.
+#' @param X_k  n-by-p matrix of knockoff variables.
+#' @param y    numeric vector of length n, containing the response variables.
+#' @param omp  whether to use orthogonal matching pursuit (default: F).
+#' @return A vector of statistics \eqn{W} of length p.
+#' 
+#' @family statistics
+#' 
+#' @examples
+#' set.seed(2022)
+#' p=100; n=100; k=15
+#' mu = rep(0,p); Sigma = diag(p)
+#' X = matrix(rnorm(n*p),n)
+#' nonzero = sample(p, k)
+#' beta = 3.5 * (1:p %in% nonzero)
+#' y = X %*% beta + rnorm(n)
+#' knockoffs = function(X) create.gaussian(X, mu, Sigma)
+#' 
+#' # Basic usage with default arguments
+#' result = knockoff.filter(X, y, knockoffs=knockoffs,
+#'                            statistic=stat.forward_selection)
+#' print(result$selected)
+#' 
+#' # Advanced usage with custom arguments
+#' foo = stat.forward_selection
+#' k_stat = function(X, X_k, y) foo(X, X_k, y, omp=TRUE)
+#' result = knockoff.filter(X, y, knockoffs=knockoffs, statistic=k_stat)
+#' print(result$selected)
+#' 
+#' @rdname stat.forward_selection
+#' @export
+stat.forward_selection <- function(X, X_k, y, omp=F) {
+  if( is.numeric(y) ){
+    y = as.vector(y)
+  } else {
+    stop('Knockoff statistic stat.forward_selection requires the input y to be a numeric vector')
+  }
+  p = ncol(X)
+  X = scale(X)
+  X_k = scale(X_k)
+  
+  # Randomly swap columns of X and Xk
+  swap = rbinom(ncol(X),1,0.5)
+  swap.M = matrix(swap,nrow=nrow(X),ncol=length(swap),byrow=TRUE)
+  X.swap  = X * (1-swap.M) + X_k * swap.M
+  Xk.swap = X * swap.M + X_k * (1-swap.M)
+  
+  # Compute statistics
+  path = fs(cbind(X.swap, Xk.swap), y, omp)
+  Z = 2*p + 1 - order(path) # Are we recycling here?
+  orig = 1:p
+  W = pmax(Z[orig], Z[orig+p]) * sign(Z[orig] - Z[orig+p])
+  # Correct for swapping of columns of X and Xk
+  W = W * (1-2*swap)
+}
+
+#' Forward selection
+#' 
+#' Perform forward variable selection with or without OMP
+#' 
+#' @param X matrix of predictors
+#' @param y response vector
+#' @param omp whether to use orthogonal matching pursuit (OMP)
+#' @return vector with jth component the variable added at step j
+#' 
+#' @keywords internal
+fs <- function(X, y, omp=FALSE) {
+  n = nrow(X); p = ncol(X)
+  stopifnot(n == length(y))
+  path = rep.int(0, p)
+  in_model = rep(FALSE, p)
+  residual = y
+  if (omp) Q = matrix(0, n, p)
+  
+  for (step in 1:p) {
+    # Find the best variable to add among the remaining variables.
+    available_vars = which(!in_model)
+    products = apply(X[,!in_model,drop=F], 2,
+                     function(x) abs(sum(x * residual)))
+    best_var = available_vars[which.max(products)][1]
+    path[step] = best_var
+    in_model[best_var] = TRUE
+    
+    # Update the residual.
+    x = X[,best_var]
+    if (step == p) break
+    if (omp) {
+      for (j in seq(1, length.out=step-1))
+        x = x - Q[,j]%*%x * Q[,j]
+      q = x / sqrt(sum(x^2))
+      Q[,step] = q
+      residual = residual - (q%*%y)[1] * q
+    } 
+    else {
+      residual = residual - (x %*% residual)[1] * x
+    }
+  }
+  return(path)
+}
+
+
+
+================================================
+FILE: R/knockoff/R/stats_glmnet.R
+================================================
+#' Importance statistics based on a GLM
+#' 
+#' Fits a generalized linear model via penalized maximum likelihood and
+#' computes the difference statistic
+#'   \deqn{W_j = Z_j - \tilde{Z}_j}
+#' where \eqn{Z_j} and \eqn{\tilde{Z}_j} are the maximum values of the 
+#' regularization parameter \eqn{\lambda} at which the jth variable 
+#' and its knockoff enter the model, respectively.
+#' 
+#' @param X n-by-p matrix of original variables.
+#' @param X_k n-by-p matrix of knockoff variables.
+#' @param y vector of length n, containing the response variables. Quantitative for family="gaussian", 
+#' or family="poisson" (non-negative counts). For family="binomial" 
+#' should be either a factor with two levels, or a two-column matrix of counts 
+#' or proportions (the second column is treated as the target class; for a factor, 
+#' the last level in alphabetical order is the target class). For family="multinomial", 
+#' can be a nc>=2 level factor, or a matrix with nc columns of counts or proportions. 
+#' For either "binomial" or "multinomial", if y is presented as a vector, it will 
+#' be coerced into a factor. For family="cox", y should be a two-column matrix with 
+#' columns named 'time' and 'status'. The latter is a binary variable, with '1' 
+#' indicating death, and '0' indicating right censored. The function Surv() in 
+#' package survival produces such a matrix. For family="mgaussian", y is a matrix 
+#' of quantitative responses.
+#' @param family response type (see above).
+#' @param ... additional arguments specific to \code{glmnet} (see Details).
+#' @return A vector of statistics \eqn{W} of length p.
+#' 
+#' @details This function uses \code{glmnet} to compute the regularization path
+#' on a fine grid of \eqn{\lambda}'s.
+#' 
+#' The \code{nlambda} parameter can be used to control the granularity of the 
+#' grid of \eqn{\lambda}'s. The default value of \code{nlambda} is \code{500}.
+#' 
+#' If the family is 'binomial' and a lambda sequence is not provided by the user, 
+#' this function generates it on a log-linear scale before calling 'glmnet'.
+#' 
+#' The default response family is 'gaussian', for a linear regression model.
+#' Different response families (e.g. 'binomial') can be specified by passing an
+#' optional parameter 'family'.
+#' 
+#' For a complete list of the available additional arguments, see \code{\link[glmnet]{glmnet}}.
+#' 
+#' @family statistics
+#' 
+#' @examples
+#' set.seed(2022)
+#' p=200; n=100; k=15
+#' mu = rep(0,p); Sigma = diag(p)
+#' X = matrix(rnorm(n*p),n)
+#' nonzero = sample(p, k)
+#' beta = 3.5 * (1:p %in% nonzero)
+#' y = X %*% beta + rnorm(n)
+#' knockoffs = function(X) create.gaussian(X, mu, Sigma)
+#' 
+#' # Basic usage with default arguments
+#' result = knockoff.filter(X, y, knockoffs=knockoffs, 
+#'                            statistic=stat.glmnet_lambdadiff)
+#' print(result$selected)
+#' 
+#' # Advanced usage with custom arguments
+#' foo = stat.glmnet_lambdadiff
+#' k_stat = function(X, X_k, y) foo(X, X_k, y, nlambda=200)
+#' result = knockoff.filter(X, y, knockoffs=knockoffs, statistic=k_stat)
+#' print(result$selected)
+#' 
+#' @rdname stat.glmnet_lambdadiff
+#' @export
+stat.glmnet_lambdadiff <- function(X, X_k, y, family='gaussian', ...) {
+  # Randomly swap columns of X and Xk
+  swap = rbinom(ncol(X),1,0.5)
+  swap.M = matrix(swap,nrow=nrow(X),ncol=length(swap),byrow=TRUE)
+  X.swap  = X * (1-swap.M) + X_k * swap.M
+  Xk.swap = X * swap.M + X_k * (1-swap.M)
+  
+  # Compute statistics
+  Z = lasso_max_lambda(cbind(X.swap, Xk.swap), y, method='glmnet', family=family, ...)
+  p = ncol(X)
+  orig = 1:p
+  W = Z[orig] - Z[orig+p]
+  
+  # Correct for swapping of columns of X and Xk
+  W = W * (1-2*swap)
+}
+
+#' GLM statistics for knockoff
+#' 
+#' Computes the signed maximum statistic
+#'   \deqn{W_j = \max(Z_j, \tilde{Z}_j) \cdot \mathrm{sgn}(Z_j - \tilde{Z}_j),}
+#' where \eqn{Z_j} and \eqn{\tilde{Z}_j} are the maximum values of 
+#' \eqn{\lambda} at which the jth variable and its knockoff, respectively,
+#' enter the generalized linear model.
+#' 
+#' @param X n-by-p matrix of original variables.
+#' @param X_k n-by-p matrix of knockoff variables.
+#' @param y vector of length n, containing the response variables. Quantitative for family="gaussian", 
+#' or family="poisson" (non-negative counts). For family="binomial" 
+#' should be either a factor with two levels, or a two-column matrix of counts 
+#' or proportions (the second column is treated as the target class; for a factor, 
+#' the last level in alphabetical order is the target class). For family="multinomial", 
+#' can be a nc>=2 level factor, or a matrix with nc columns of counts or proportions. 
+#' For either "binomial" or "multinomial", if y is presented as a vector, it will 
+#' be coerced into a factor. For family="cox", y should be a two-column matrix with 
+#' columns named 'time' and 'status'. The latter is a binary variable, with '1' 
+#' indicating death, and '0' indicating right censored. The function Surv() in 
+#' package survival produces such a matrix. For family="mgaussian", y is a matrix 
+#' of quantitative responses.
+#' @param family response type (see above).
+#' @param ... additional arguments specific to \code{glmnet} (see Details).
+#' @return A vector of statistics \eqn{W} of length p.
+#'   
+#' @details This function uses \code{glmnet} to compute the regularization path
+#' on a fine grid of \eqn{\lambda}'s.
+#' 
+#' The additional \code{nlambda} 
+#' parameter can be used to control the granularity of the grid of \eqn{\lambda} values. 
+#' The default value of \code{nlambda} is \code{500}.
+#' 
+#' If the family is 'binomial' and a lambda sequence is not provided by the user, 
+#' this function generates it on a log-linear scale before calling 'glmnet'.
+#' 
+#' For a complete list of the available additional arguments, see \code{\link[glmnet]{glmnet}}.
+#' 
+#' @examples
+#' p=200; n=100; k=15
+#' mu = rep(0,p); Sigma = diag(p)
+#' X = matrix(rnorm(n*p),n)
+#' nonzero = sample(p, k)
+#' beta = 3.5 * (1:p %in% nonzero)
+#' y = X %*% beta + rnorm(n)
+#' knockoffs = function(X) create.gaussian(X, mu, Sigma)
+#' 
+#' # Basic usage with default arguments
+#' result = knockoff.filter(X, y, knockoff=knockoffs,
+#'                            statistic=stat.glmnet_lambdasmax)
+#' print(result$selected)
+#' 
+#' # Advanced usage with custom arguments
+#' foo = stat.glmnet_lambdasmax
+#' k_stat = function(X, X_k, y) foo(X, X_k, y, nlambda=200)
+#' result = knockoff.filter(X, y, knockoffs=knockoffs, statistic=k_stat)
+#' print(result$selected)
+#' 
+#' @rdname stat.glmnet_lambdasmax
+#' @export
+stat.glmnet_lambdasmax <- function(X, X_k, y, family='gaussian', ...) {
+  # Randomly swap columns of X and Xk
+  swap = rbinom(ncol(X),1,0.5)
+  swap.M = matrix(swap,nrow=nrow(X),ncol=length(swap),byrow=TRUE)
+  X.swap  = X * (1-swap.M) + X_k * swap.M
+  Xk.swap = X * swap.M + X_k * (1-swap.M)
+  
+  # Compute statistics
+  Z = lasso_max_lambda(cbind(X.swap, Xk.swap), y, method='glmnet', family=family, ...)
+  p = ncol(X)
+  orig = 1:p
+  W = pmax(Z[orig], Z[orig+p]) * sign(Z[orig] - Z[orig+p])
+  
+  # Correct for swapping of columns of X and Xk
+  W = W * (1-2*swap)
+}
+
+#' @keywords internal
+lasso_max_lambda_lars <- function(X, y, ...) {
+  if (!requireNamespace('lars', quietly=T))
+    stop('lars is not installed', call.=F)
+  
+  fit <- lars::lars(X, y, normalize=T, intercept=F, ...)
+  lambda <- rep(0, ncol(X))
+  for (j in 1:ncol(X)) {
+    entry <- fit$entry[j]
+    if (entry > 0) lambda[j] <- fit$lambda[entry]
+  }
+  return(lambda)
+}
+
+#' @keywords internal
+lasso_max_lambda_glmnet <- function(X, y, nlambda=500, intercept=T, standardize=T, ...) {
+  if (!requireNamespace('glmnet', quietly=T))
+    stop('glmnet is not installed', call.=F)
+  
+  # Standardize the variables
+  if( standardize ){
+    X = scale(X)
+  }
+    
+  n = nrow(X); p = ncol(X)
+  if (!methods::hasArg(family) ) family = "gaussian"
+  else family = list(...)$family
+  
+  if (!methods::hasArg(lambda) ) {
+    if( identical(family, "gaussian") ) {
+      if(!is.numeric(y)) {
+        stop('Input y must be numeric.')
+      }
+      # Unless a lambda sequence is provided by the user, generate it
+      lambda_max = max(abs(t(X) %*% y)) / n
+      lambda_min = lambda_max / 2e3
+      k = (0:(nlambda-1)) / nlambda
+      lambda = lambda_max * (lambda_min/lambda_max)^k
+    }
+    else {
+      lambda = NULL
+    }
+  }
+
+  fit <- glmnet::glmnet(X, y, lambda=lambda, intercept=intercept, standardize=F, standardize.response=F, ...)
+  
+  first_nonzero <- function(x) match(T, abs(x) > 0) # NA if all(x==0)
+  if(family=="multinomial") {
+      indices <- sapply(fit$beta, function(beta) apply(beta, 1, first_nonzero))
+      indices <- apply(indices, 1, min)
+  } else {
+      indices <- apply(fit$beta, 1, first_nonzero)
+  }
+  names(indices) <- NULL
+  ifelse(is.na(indices), 0, fit$lambda[indices] * n)
+}
+
+#' Maximum lambda in lasso model
+#' 
+#' Computes the earliest (largest) lambda's for which predictors enter the
+#' lasso model.
+#' 
+#' @param X matrix of predictors
+#' @param y response vector
+#' @param method either 'glmnet' or 'lars'
+#' @return vector of maximum lambda's
+#' 
+#' @keywords internal
+lasso_max_lambda <- function(X, y, method=c('glmnet','lars'), ...) {
+  switch(match.arg(method), 
+         glmnet = lasso_max_lambda_glmnet(X,y,...),
+         lars = lasso_max_lambda_lars(X,y,...)
+         )
+}
+
+
+
+================================================
+FILE: R/knockoff/R/stats_glmnet_cv.R
+================================================
+#' Importance statistics based on a GLM with cross-validation
+#' 
+#' Fits a generalized linear model via penalized maximum likelihood and cross-validation.
+#' Then, compute the difference statistic
+#'   \deqn{W_j = |Z_j| - |\tilde{Z}_j|}
+#' where \eqn{Z_j} and \eqn{\tilde{Z}_j} are the coefficient estimates for the 
+#' jth variable and its knockoff, respectively. The value of the regularization
+#' parameter \eqn{\lambda} is selected by cross-validation and computed with \code{glmnet}.
+#' 
+#' @param X n-by-p matrix of original variables.
+#' @param X_k n-by-p matrix of knockoff variables.
+#' @param y vector of length n, containing the response variables. Quantitative for family="gaussian", 
+#' or family="poisson" (non-negative counts). For family="binomial" 
+#' should be either a factor with two levels, or a two-column matrix of counts 
+#' or proportions (the second column is treated as the target class; for a factor, 
+#' the last level in alphabetical order is the target class). For family="multinomial", 
+#' can be a nc>=2 level factor, or a matrix with nc columns of counts or proportions. 
+#' For either "binomial" or "multinomial", if y is presented as a vector, it will 
+#' be coerced into a factor. For family="cox", y should be a two-column matrix with 
+#' columns named 'time' and 'status'. The latter is a binary variable, with '1' 
+#' indicating death, and '0' indicating right censored. The function Surv() in 
+#' package survival produces such a matrix. For family="mgaussian", y is a matrix 
+#' of quantitative responses.
+#' @param family response type (see above).
+#' @param cores Number of cores used to compute the statistics by running cv.glmnet.
+#' Unless otherwise specified, the number of cores is set equal to two (if available).
+
+#' @param ... additional arguments specific to \code{glmnet} (see Details).
+#' @return A vector of statistics \eqn{W} of length p.
+#' 
+#' @details This function uses the \code{glmnet} package to fit a generalized linear model
+#' via penalized maximum likelihood.
+#' 
+#' The statistics \eqn{W_j} are constructed by taking the difference 
+#' between the coefficient of the j-th variable and its knockoff.
+#'  
+#' By default, the value of the regularization parameter is chosen by 10-fold cross-validation.
+#' 
+#' The default response family is 'gaussian', for a linear regression model.
+#' Different response families (e.g. 'binomial') can be specified by passing an
+#' optional parameter 'family'.
+#' 
+#' The optional \code{nlambda} parameter can be used to control the granularity of the 
+#' grid of \eqn{\lambda}'s. The default value of \code{nlambda} is \code{500},
+#' where \code{p} is the number of columns of \code{X}.
+#' 
+#' If the family is 'binomial' and a lambda sequence is not provided by the user, 
+#' this function generates it on a log-linear scale before calling 'glmnet'.
+#' 
+#' For a complete list of the available additional arguments, see \code{\link[glmnet]{cv.glmnet}}
+#' and \code{\link[glmnet]{glmnet}}.
+#' 
+#' @family statistics
+#' 
+#' @examples
+#' set.seed(2022)
+#' p=200; n=100; k=15
+#' mu = rep(0,p); Sigma = diag(p)
+#' X = matrix(rnorm(n*p),n)
+#' nonzero = sample(p, k)
+#' beta = 3.5 * (1:p %in% nonzero)
+#' y = X %*% beta + rnorm(n)
+#' knockoffs = function(X) create.gaussian(X, mu, Sigma)
+#' 
+#' # Basic usage with default arguments
+#' result = knockoff.filter(X, y, knockoffs=knockoffs, 
+#'                            statistic=stat.glmnet_coefdiff)
+#' print(result$selected)
+#' 
+#' # Advanced usage with custom arguments
+#' foo = stat.glmnet_coefdiff
+#' k_stat = function(X, X_k, y) foo(X, X_k, y, nlambda=200)
+#' result = knockoff.filter(X, y, knockoffs=knockoffs, statistic=k_stat)
+#' print(result$selected)
+#' 
+#' @rdname stat.glmnet_coefdiff
+#' @export
+stat.glmnet_coefdiff <- function(X, X_k, y, family='gaussian', cores=2, ...) {
+  if (!requireNamespace('glmnet', quietly=T))
+    stop('glmnet is not installed', call.=F)
+  parallel=T
+  if (!requireNamespace('doParallel', quietly=T)) {
+    warning('doParallel is not installed. Without parallelization, the statistics will be slower to compute', call.=F,immediate.=T)
+    parallel=F
+  }
+  if (!requireNamespace('parallel', quietly=T)) {
+    warning('parallel is not installed. Without parallelization, the statistics will be slower to compute.', call.=F,immediate.=T)
+    parallel=F
+  }
+    
+  # Register cores for parallel computation
+  if (parallel) {
+    ncores = parallel::detectCores(all.tests = TRUE, logical = TRUE)
+    if( cores==2 ) {
+      cores = min(2,ncores)
+    }
+    else {
+      if (cores > ncores ) {
+        warning(paste("The requested number of cores is not available. Using instead",ncores,"cores"),immediate.=T)
+        cores = ncores
+      }
+    }
+    if (cores>1) {
+      doParallel::registerDoParallel(cores=cores)
+      parallel = TRUE
+    }
+    else {
+      parallel = FALSE
+    }
+  }
+  
+  # Randomly swap columns of X and Xk
+  swap = rbinom(ncol(X),1,0.5)
+  swap.M = matrix(swap,nrow=nrow(X),ncol=length(swap),byrow=TRUE)
+  X.swap  = X * (1-swap.M) + X_k * swap.M
+  Xk.swap = X * swap.M + X_k * (1-swap.M)
+
+  p = ncol(X)
+
+  # Compute statistics
+  glmnet.coefs = cv_coeffs_glmnet(cbind(X.swap, Xk.swap), y, family=family, parallel=parallel, ...)
+  if(family=="multinomial") {
+      Z <- abs(glmnet.coefs[[1]][2:(2*p+1)])
+      for(b in 2:length(glmnet.coefs)) {
+          Z <- Z + abs(glmnet.coefs[[b]][2:(2*p+1)])
+      }
+  } else if (family=="cox") {
+      Z <- glmnet.coefs[1:(2*p)]
+  } else {
+      Z <- glmnet.coefs[2:(2*p+1)]
+  }
+  orig = 1:p
+  W = abs(Z[orig]) - abs(Z[orig+p])
+  
+  # Correct for swapping of columns of X and Xk
+  W = W * (1-2*swap)
+
+  # Stop the parallel cluster (if applicable)  
+  if (parallel) {
+    if (cores>1) {
+      doParallel::stopImplicitCluster()
+    }
+  }
+  return(W)
+}
+
+#' @keywords internal
+cv_coeffs_glmnet <- function(X, y, nlambda=500, intercept=T, parallel=T, ...) {
+  # Standardize variables
+  X = scale(X)
+  
+  n = nrow(X); p = ncol(X)
+  
+  if (!methods::hasArg(family) ) family = "gaussian"
+  else family = list(...)$family
+  
+  if (!methods::hasArg(lambda) ) {
+    if( identical(family, "gaussian") ) {
+      if(!is.numeric(y)) {
+        stop('Input y must be numeric.')
+      }
+      # Unless a lambda sequence is provided by the user, generate it
+      lambda_max = max(abs(t(X) %*% y)) / n
+      lambda_min = lambda_max / 2e3
+      k = (0:(nlambda-1)) / nlambda
+      lambda = lambda_max * (lambda_min/lambda_max)^k
+    }
+    else {
+      lambda = NULL
+    }
+  }
+  
+  cv.glmnet.fit <- glmnet::cv.glmnet(X, y, lambda=lambda, intercept=intercept,
+                                     standardize=F,standardize.response=F, parallel=parallel, ...)
+  
+  coef(cv.glmnet.fit, s = "lambda.min")
+}
+
+
+
+================================================
+FILE: R/knockoff/R/stats_lasso.R
+================================================
+#' Importance statistics based on the lasso
+#' 
+#' Fit the lasso path and computes the difference statistic
+#'   \deqn{W_j = Z_j - \tilde{Z}_j}
+#' where \eqn{Z_j} and \eqn{\tilde{Z}_j} are the maximum values of the 
+#' regularization parameter \eqn{\lambda} at which the jth variable 
+#' and its knockoff enter the penalized linear regression model, respectively.
+#' 
+#' @param X n-by-p matrix of original variables.
+#' @param X_k n-by-p matrix of knockoff variables.
+#' @param y vector of length n, containing the response variables. It should be numeric.
+#' @param ... additional arguments specific to \code{glmnet} (see Details).
+#' @return A vector of statistics \eqn{W} of length p.
+#' 
+#' @details This function uses \code{glmnet} to compute the lasso path
+#' on a fine grid of \eqn{\lambda}'s and is a wrapper around the more general
+#' \link{stat.glmnet_lambdadiff}.
+#' 
+#' The \code{nlambda} parameter can be used to control the granularity of the 
+#' grid of \eqn{\lambda}'s. The default value of \code{nlambda} is \code{500}.
+#' 
+#' Unless a lambda sequence is provided by the user, this function generates it on a 
+#' log-linear scale before calling \code{glmnet} (default 'nlambda': 500).
+#' 
+#' For a complete list of the available additional arguments, see \code{\link[glmnet]{glmnet}}
+#' or \code{\link[lars]{lars}}.
+#' 
+#' @family statistics
+#' 
+#' @examples
+#' set.seed(2022)
+#' p=200; n=100; k=15
+#' mu = rep(0,p); Sigma = diag(p)
+#' X = matrix(rnorm(n*p),n)
+#' nonzero = sample(p, k)
+#' beta = 3.5 * (1:p %in% nonzero)
+#' y = X %*% beta + rnorm(n)
+#' knockoffs = function(X) create.gaussian(X, mu, Sigma)
+#' 
+#' # Basic usage with default arguments
+#' result = knockoff.filter(X, y, knockoffs=knockoffs, 
+#'                            statistic=stat.lasso_lambdadiff)
+#' print(result$selected)
+#' 
+#' # Advanced usage with custom arguments
+#' foo = stat.lasso_lambdadiff
+#' k_stat = function(X, X_k, y) foo(X, X_k, y, nlambda=200)
+#' result = knockoff.filter(X, y, knockoffs=knockoffs, statistic=k_stat)
+#' print(result$selected)
+#' 
+#' @rdname stat.lasso_lambdadiff
+#' @export
+stat.lasso_lambdadiff <- function(X, X_k, y, ...) {
+  if( is.numeric(y) ){
+    y = as.vector(y)
+  } else {
+    stop('Knockoff statistic stat.lasso_lambdadiff requires the input y to be a numeric vector')
+  }
+  
+  stat.glmnet_lambdadiff(X, X_k, y, family='gaussian', ...)
+}
+
+#' Penalized linear regression statistics for knockoff
+#' 
+#' Computes the signed maximum statistic
+#'   \deqn{W_j = \max(Z_j, \tilde{Z}_j) \cdot \mathrm{sgn}(Z_j - \tilde{Z}_j),}
+#' where \eqn{Z_j} and \eqn{\tilde{Z}_j} are the maximum values of 
+#' \eqn{\lambda} at which the jth variable and its knockoff, respectively,
+#' enter the penalized linear regression model.
+#' 
+#' @param X n-by-p matrix of original variables.
+#' @param X_k n-by-p matrix of knockoff variables.
+#' @param y vector of length n, containing the response variables. It should be numeric.
+#' @param ... additional arguments specific to \code{glmnet} or \code{lars} (see Details).
+#' @return A vector of statistics \eqn{W} of length p.
+#'   
+#' @details This function uses \code{glmnet} to compute the regularization path
+#' on a fine grid of \eqn{\lambda}'s.
+#' 
+#' The additional \code{nlambda} 
+#' parameter can be used to control the granularity of the grid of \eqn{\lambda} values. 
+#' The default value of \code{nlambda} is \code{500}.
+#' 
+#' Unless a lambda sequence is provided by the user, this function generates it on a 
+#' log-linear scale before calling \code{glmnet} (default 'nlambda': 500).
+#' 
+#' This function is a wrapper around the more general 
+#' \code{\link{stat.glmnet_lambdadiff}}.
+#' 
+#' For a complete list of the available additional arguments, see \code{\link[glmnet]{glmnet}}.
+#' 
+#' @examples
+#' p=200; n=100; k=15
+#' mu = rep(0,p); Sigma = diag(p)
+#' X = matrix(rnorm(n*p),n)
+#' nonzero = sample(p, k)
+#' beta = 3.5 * (1:p %in% nonzero)
+#' y = X %*% beta + rnorm(n)
+#' knockoffs = function(X) create.gaussian(X, mu, Sigma)
+#' 
+#' # Basic usage with default arguments
+#' result = knockoff.filter(X, y, knockoff=knockoffs,
+#'                            statistic=stat.lasso_lambdasmax)
+#' print(result$selected)
+#' 
+#' # Advanced usage with custom arguments
+#' foo = stat.lasso_lambdasmax
+#' k_stat = function(X, X_k, y) foo(X, X_k, y, nlambda=200)
+#' result = knockoff.filter(X, y, knockoffs=knockoffs, statistic=k_stat)
+#' print(result$selected)
+#' 
+#' @rdname stat.lasso_lambdasmax
+#' @export
+stat.lasso_lambdasmax <- function(X, X_k, y, ...) {
+  if( is.numeric(y) ){
+    y = as.vector(y)
+  } else {
+    stop('Knockoff statistic stat.lasso_lambdasmax requires the input y to be a numeric vector')
+  }
+
+  stat.glmnet_lambdasmax(X, X_k, y, family='gaussian', ...)
+}
+
+
+================================================
+FILE: R/knockoff/R/stats_lasso_bin.R
+================================================
+#' Importance statistics based on regularized logistic regression
+#' 
+#' Fit the lasso path and computes the difference statistic
+#'   \deqn{W_j = Z_j - \tilde{Z}_j}
+#' where \eqn{Z_j} and \eqn{\tilde{Z}_j} are the maximum values of the 
+#' regularization parameter \eqn{\lambda} at which the jth variable 
+#' and its knockoff enter the penalized logistic regression model, respectively.
+#' 
+#' @param X n-by-p matrix of original variables.
+#' @param X_k n-by-p matrix of knockoff variables.
+#' @param y vector of length n, containing the response variables. It should be either a factor with two levels, 
+#' or a two-column matrix of counts or proportions 
+#' (the second column is treated as the target class; for a factor, the last level 
+#' in alphabetical order is the target class). If y is presented as a vector, 
+#' it will be coerced into a factor.
+#' @param ... additional arguments specific to \code{glmnet} (see Details).
+#' @return A vector of statistics \eqn{W} of length p.
+#' 
+#' @details This function uses \code{glmnet} to compute the lasso path
+#' on a fine grid of \eqn{\lambda}'s.
+#' 
+#' The \code{nlambda} parameter can be used to control the granularity of the 
+#' grid of \eqn{\lambda}'s. The default value of \code{nlambda} is \code{500}.
+#' 
+#' This function is a wrapper around the more general \code{\link{stat.glmnet_lambdadiff}}.
+#' 
+#' For a complete list of the available additional arguments, see \code{\link[glmnet]{glmnet}}
+#' or \code{\link[lars]{lars}}.
+#' 
+#' @family statistics
+#' 
+#' @examples
+#' set.seed(2022)
+#' p=200; n=100; k=15
+#' mu = rep(0,p); Sigma = diag(p)
+#' X = matrix(rnorm(n*p),n)
+#' nonzero = sample(p, k)
+#' beta = 3.5 * (1:p %in% nonzero)
+#' pr = 1/(1+exp(-X %*% beta))
+#' y = rbinom(n,1,pr)
+#' knockoffs = function(X) create.gaussian(X, mu, Sigma)
+#' 
+#' # Basic usage with default arguments
+#' result = knockoff.filter(X, y, knockoffs=knockoffs, 
+#'                            statistic=stat.lasso_lambdadiff_bin)
+#' print(result$selected)
+#' 
+#' # Advanced usage with custom arguments
+#' foo = stat.lasso_lambdadiff_bin
+#' k_stat = function(X, X_k, y) foo(X, X_k, y, nlambda=200)
+#' result = knockoff.filter(X, y, knockoffs=knockoffs, statistic=k_stat)
+#' print(result$selected)
+#' 
+#' @rdname stat.lasso_lambdadiff_bin
+#' @export
+stat.lasso_lambdadiff_bin <- function(X, X_k, y, ...) {
+  stat.glmnet_lambdadiff(X, X_k, y, family='binomial', ...)
+}
+
+#' Penalized logistic regression statistics for knockoff
+#' 
+#' Computes the signed maximum statistic
+#'   \deqn{W_j = \max(Z_j, \tilde{Z}_j) \cdot \mathrm{sgn}(Z_j - \tilde{Z}_j),}
+#' where \eqn{Z_j} and \eqn{\tilde{Z}_j} are the maximum values of 
+#' \eqn{\lambda} at which the jth variable and its knockoff, respectively,
+#' enter the penalized logistic regression model.
+#' 
+#' @param X n-by-p matrix of original variables.
+#' @param X_k n-by-p matrix of knockoff variables.
+#' @param y vector of length n, containing the response variables. It should be either a factor with two levels, 
+#' or a two-column matrix of counts or proportions 
+#' (the second column is treated as the target class; for a factor, the last level 
+#' in alphabetical order is the target class). If y is presented as a vector, 
+#' it will be coerced into a factor.
+#' @param ... additional arguments specific to \code{glmnet} or \code{lars} (see Details).
+#' @return A vector of statistics \eqn{W} of length p.
+#'   
+#' @details This function uses \code{glmnet} to compute the regularization path
+#' on a fine grid of \eqn{\lambda}'s.
+#' 
+#' The additional \code{nlambda} 
+#' parameter can be used to control the granularity of the grid of \eqn{\lambda} values. 
+#' The default value of \code{nlambda} is \code{500}.
+#' 
+#' This function is a wrapper around the more general 
+#' \link{stat.glmnet_lambdadiff}.
+#' 
+#' For a complete list of the available additional arguments, see \code{\link[glmnet]{glmnet}}.
+#' 
+#' @examples
+#' p=200; n=100; k=15
+#' mu = rep(0,p); Sigma = diag(p)
+#' X = matrix(rnorm(n*p),n)
+#' nonzero = sample(p, k)
+#' beta = 3.5 * (1:p %in% nonzero)
+#' pr = 1/(1+exp(-X %*% beta))
+#' y = rbinom(n,1,pr)
+#' knockoffs = function(X) create.gaussian(X, mu, Sigma)
+#' 
+#' # Basic usage with default arguments
+#' result = knockoff.filter(X, y, knockoff=knockoffs,
+#'                            statistic=stat.lasso_lambdasmax_bin)
+#' print(result$selected)
+#' 
+#' # Advanced usage with custom arguments
+#' foo = stat.lasso_lambdasmax_bin
+#' k_stat = function(X, X_k, y) foo(X, X_k, y, nlambda=200)
+#' result = knockoff.filter(X, y, knockoffs=knockoffs, statistic=k_stat)
+#' print(result$selected)
+#' 
+#' @rdname stat.lasso_lambdasmax_bin
+#' @export
+stat.lasso_lambdasmax_bin <- function(X, X_k, y, ...) {
+  stat.glmnet_lambdasmax(X, X_k, y, family='binomial', ...)
+}
+
+
+================================================
+FILE: R/knockoff/R/stats_lasso_cv.R
+================================================
+#' Importance statistics based the lasso with cross-validation
+#' 
+#' Fits a linear regression model via penalized maximum likelihood and cross-validation.
+#' Then, compute the difference statistic
+#'   \deqn{W_j = |Z_j| - |\tilde{Z}_j|}
+#' where \eqn{Z_j} and \eqn{\tilde{Z}_j} are the coefficient estimates for the 
+#' jth variable and its knockoff, respectively. The value of the regularization
+#' parameter \eqn{\lambda} is selected by cross-validation and computed with \code{glmnet}.
+#' 
+#' @param X n-by-p matrix of original variables.
+#' @param X_k n-by-p matrix of knockoff variables.
+#' @param y vector of length n, containing the response variables. It should be numeric
+#' @param cores Number of cores used to compute the statistics by running cv.glmnet.
+#' If not specified, the number of cores is set to approximately half of the number of cores 
+#' detected by the parallel package.
+#' @param ... additional arguments specific to \code{glmnet} (see Details).
+#' @return A vector of statistics \eqn{W} of length p.
+#' 
+#' @details This function uses the \code{glmnet} package to fit the lasso path and 
+#' is a wrapper around the more general \link{stat.glmnet_coefdiff}.
+#' 
+#' The statistics \eqn{W_j} are constructed by taking the difference 
+#' between the coefficient of the j-th variable and its knockoff.
+#'  
+#' By default, the value of the regularization parameter is chosen by 10-fold cross-validation.
+#' 
+#' The optional \code{nlambda} parameter can be used to control the granularity of the 
+#' grid of \eqn{\lambda}'s. The default value of \code{nlambda} is \code{500},
+#' where \code{p} is the number of columns of \code{X}.
+#' 
+#' Unless a lambda sequence is provided by the user, this function generates it on a 
+#' log-linear scale before calling 'glmnet' (default 'nlambda': 500).
+#' 
+#' For a complete list of the available additional arguments, see \code{\link[glmnet]{cv.glmnet}}
+#' and \code{\link[glmnet]{glmnet}}.
+#' 
+#' @family statistics
+#' 
+#' @examples
+#' set.seed(2022)
+#' p=200; n=100; k=15
+#' mu = rep(0,p); Sigma = diag(p)
+#' X = matrix(rnorm(n*p),n)
+#' nonzero = sample(p, k)
+#' beta = 3.5 * (1:p %in% nonzero)
+#' y = X %*% beta + rnorm(n)
+#' knockoffs = function(X) create.gaussian(X, mu, Sigma)
+#' 
+#' # Basic usage with default arguments
+#' result = knockoff.filter(X, y, knockoffs=knockoffs, 
+#'                            statistic=stat.lasso_coefdiff)
+#' print(result$selected)
+#' 
+#' # Advanced usage with custom arguments
+#' foo = stat.lasso_coefdiff
+#' k_stat = function(X, X_k, y) foo(X, X_k, y, nlambda=200)
+#' result = knockoff.filter(X, y, knockoffs=knockoffs, statistic=k_stat)
+#' print(result$selected)
+#' 
+#' @rdname stat.lasso_coefdiff
+#' @export
+stat.lasso_coefdiff <- function(X, X_k, y, cores=2, ...) {
+  if( is.numeric(y) ){
+    y = as.vector(y)
+  } else {
+    stop('Knockoff statistic stat.lasso_coefdiff requires the input y to be a numeric vector')
+  }
+  
+  stat.glmnet_coefdiff(X, X_k, y, family='gaussian', cores=cores, ...)
+}
+
+
+
+================================================
+FILE: R/knockoff/R/stats_lasso_cv_bin.R
+================================================
+#' Importance statistics based on regularized logistic regression with cross-validation
+#' 
+#' Fits a logistic regression model via penalized maximum likelihood and cross-validation.
+#' Then, compute the difference statistic
+#'   \deqn{W_j = |Z_j| - |\tilde{Z}_j|}
+#' where \eqn{Z_j} and \eqn{\tilde{Z}_j} are the coefficient estimates for the 
+#' jth variable and its knockoff, respectively. The value of the regularization
+#' parameter \eqn{\lambda} is selected by cross-validation and computed with \code{glmnet}.
+#' 
+#' @param X n-by-p matrix of original variables..
+#' @param X_k n-by-p matrix of knockoff variables.
+#' @param y vector of length n, containing the response variables. It should be either a factor with two levels, 
+#' or a two-column matrix of counts or proportions 
+#' (the second column is treated as the target class; for a factor, the last level 
+#' in alphabetical order is the target class). If y is presented as a vector, 
+#' it will be coerced into a factor.
+#' @param cores Number of cores used to compute the statistics by running cv.glmnet.
+#' If not specified, the number of cores is set to approximately half of the number of cores 
+#' detected by the parallel package.
+#' @param ... additional arguments specific to \code{glmnet} (see Details).
+#' @return A vector of statistics \eqn{W} of length p.
+#' 
+#' @details This function uses the \code{glmnet} package to fit the penalized logistic regression path
+#' and is a wrapper around the more general \code{\link{stat.glmnet_coefdiff}}.
+#' 
+#' The statistics \eqn{W_j} are constructed by taking the difference 
+#' between the coefficient of the j-th variable and its knockoff.
+#'  
+#' By default, the value of the regularization parameter is chosen by 10-fold cross-validation.
+#' 
+#' The optional \code{nlambda} parameter can be used to control the granularity of the 
+#' grid of \eqn{\lambda}'s. The default value of \code{nlambda} is \code{500},
+#' where \code{p} is the number of columns of \code{X}.
+#' 
+#' For a complete list of the available additional arguments, see \code{\link[glmnet]{cv.glmnet}}
+#' and \code{\link[glmnet]{glmnet}}.
+#' 
+#' @family statistics
+#' 
+#' @examples
+#' set.seed(2022)
+#' p=200; n=100; k=15
+#' mu = rep(0,p); Sigma = diag(p)
+#' X = matrix(rnorm(n*p),n)
+#' nonzero = sample(p, k)
+#' beta = 3.5 * (1:p %in% nonzero)
+#' pr = 1/(1+exp(-X %*% beta))
+#' y = rbinom(n,1,pr)
+#' knockoffs = function(X) create.gaussian(X, mu, Sigma)
+#' 
+#' # Basic usage with default arguments
+#' result = knockoff.filter(X, y, knockoffs=knockoffs, 
+#'                            statistic=stat.lasso_coefdiff_bin)
+#' print(result$selected)
+#' 
+#' # Advanced usage with custom arguments
+#' foo = stat.lasso_coefdiff_bin
+#' k_stat = function(X, X_k, y) foo(X, X_k, y, nlambda=200)
+#' result = knockoff.filter(X, y, knockoffs=knockoffs, statistic=k_stat)
+#' print(result$selected)
+#' 
+#' @rdname stat.lasso_coefdiff_bin
+#' @export
+stat.lasso_coefdiff_bin <- function(X, X_k, y, cores=2, ...) {
+  if (!is.factor(y) && !is.numeric(y)) {
+    stop('Input y must be either of numeric or factor type')
+  }
+  stat.glmnet_coefdiff(X, X_k, y, family='binomial', cores=cores, ...)
+}
+
+
+
+================================================
+FILE: R/knockoff/R/stats_random_forest.R
+================================================
+#' Importance statistics based on random forests
+#' 
+#' Computes the difference statistic
+#'   \deqn{W_j = |Z_j| - |\tilde{Z}_j|}
+#' where \eqn{Z_j} and \eqn{\tilde{Z}_j} are the random forest feature importances
+#' of the jth variable and its knockoff, respectively.
+#' 
+#' @param X n-by-p matrix of original variables.
+#' @param X_k n-by-p matrix of knockoff variables.
+#' @param y vector of length n, containing the response variables. If a factor, classification is assumed, 
+#' otherwise regression is assumed.
+#' @param ... additional arguments specific to \code{ranger} (see Details).
+#' @return A vector of statistics \eqn{W} of length p.
+#' 
+#' @details This function uses the \code{ranger} package to compute variable 
+#' importance measures. The importance of a variable is measured as the total decrease
+#' in node impurities from splitting on that variable, averaged over all trees. 
+#' For regression, the node impurity is measured by residual sum of squares.
+#' For classification, it is measured by the Gini index.
+#' 
+#' For a complete list of the available additional arguments, see \code{\link[ranger]{ranger}}. 
+#' 
+#' @family statistics
+#' 
+#' @examples
+#' set.seed(2022)
+#' p=200; n=100; k=15
+#' mu = rep(0,p); Sigma = diag(p)
+#' X = matrix(rnorm(n*p),n)
+#' nonzero = sample(p, k)
+#' beta = 3.5 * (1:p %in% nonzero)
+#' y = X %*% beta + rnorm(n)
+#' knockoffs = function(X) create.gaussian(X, mu, Sigma)
+#' 
+#' # Basic usage with default arguments
+#' result = knockoff.filter(X, y, knockoffs=knockoffs, 
+#'                            statistic=stat.random_forest)
+#' print(result$selected)
+#' 
+#' # Advanced usage with custom arguments
+#' foo = stat.random_forest
+#' k_stat = function(X, X_k, y) foo(X, X_k, y, nodesize=5)
+#' result = knockoff.filter(X, y, knockoffs=knockoffs, statistic=k_stat)
+#' print(result$selected)
+#' 
+#' @rdname stat.random_forest
+#' @export
+stat.random_forest <- function(X, X_k, y, ...) {
+  if (!requireNamespace('ranger', quietly=T))
+    stop('ranger is not installed', call.=F)
+  
+  # Randomly swap columns of X and Xk
+  swap = rbinom(ncol(X),1,0.5)
+  swap.M = matrix(swap,nrow=nrow(X),ncol=length(swap),byrow=TRUE)
+  X.swap  = X * (1-swap.M) + X_k * swap.M
+  Xk.swap = X * swap.M + X_k * (1-swap.M)
+  
+  # Compute statistics
+  Z = random_forest_importance(cbind(X.swap, Xk.swap), y) 
+  p = ncol(X)
+  orig = 1:p
+  W = abs(Z[orig]) - abs(Z[orig+p])
+  
+  # Correct for swapping of columns of X and Xk
+  W = W * (1-2*swap)
+}
+
+#' @keywords internal
+random_forest_importance <- function(X, y, ...) {
+  df = data.frame(y=y, X=X)
+  rfFit = ranger::ranger(y~., data=df, importance="impurity", write.forest=F, ...)
+  as.vector(rfFit$variable.importance)
+}
+
+
+================================================
+FILE: R/knockoff/R/stats_sqrt_lasso.R
+================================================
+#' Importance statistics based on the square-root lasso
+#' 
+#' Computes the signed maximum statistic
+#'   \deqn{W_j = \max(Z_j, \tilde{Z}_j) \cdot \mathrm{sgn}(Z_j - \tilde{Z}_j),}
+#' where \eqn{Z_j} and \eqn{\tilde{Z}_j} are the maximum values of 
+#' \eqn{\lambda} at which the jth variable and its knockoff, respectively,
+#' enter the SQRT lasso model.
+#' 
+#' @param X n-by-p matrix of original variables.
+#' @param X_k n-by-p matrix of knockoff variables.
+#' @param y vector of length n, containing the response variables of numeric type.
+#' @param ... additional arguments specific to \code{slim}.
+#' @return A vector of statistics \eqn{W} of length p.
+#' 
+#' @details With default parameters, this function uses the package \code{RPtests}
+#' to run the SQRT lasso. By specifying the appropriate optional parameters, 
+#' one can use different Lasso variants including Dantzig Selector, LAD Lasso,
+#' SQRT Lasso and Lq Lasso for estimating high dimensional sparse linear models.
+#' 
+#' For a complete list of the available additional arguments, see \code{\link[RPtests]{sqrt_lasso}}.
+#' 
+#' @family statistics
+#' 
+#' @examples
+#' set.seed(2022)
+#' p=50; n=50; k=10
+#' mu = rep(0,p); Sigma = diag(p)
+#' X = matrix(rnorm(n*p),n)
+#' nonzero = sample(p, k)
+#' beta = 3.5 * (1:p %in% nonzero)
+#' y = X %*% beta + rnorm(n)
+#' knockoffs = function(X) create.gaussian(X, mu, Sigma)
+#' 
+#' # Basic usage with default arguments
+#' result = knockoff.filter(X, y, knockoffs=knockoffs, statistic=stat.sqrt_lasso)
+#' print(result$selected)
+#' 
+#' # Advanced usage with custom arguments
+#' foo = stat.sqrt_lasso
+#' k_stat = function(X, X_k, y) foo(X, X_k, y, q=0.5)
+#' result = knockoff.filter(X, y, knockoffs=knockoffs, statistic=k_stat)
+#' print(result$selected)
+#' 
+#' @rdname stat.sqrt_lasso
+#' @export
+stat.sqrt_lasso <- function(X, X_k, y, ...) {
+  if (!requireNamespace('RPtests', quietly=T))
+    stop('RPtests is not installed', call.=F)
+  if (!(is.vector(y) && is.numeric(y)))  {
+    stop('Knockoff statistic stat.sqrt_lasso requires the input y to be a numeric vector')
+  }
+  p = ncol(X)
+  
+  # Randomly swap columns of X and Xk
+  swap = rbinom(ncol(X),1,0.5)
+  swap.M = matrix(swap,nrow=nrow(X),ncol=length(swap),byrow=TRUE)
+  X.swap  = X * (1-swap.M) + X_k * swap.M
+  Xk.swap = X * swap.M + X_k * (1-swap.M)
+  
+  # Compute statistics
+  Z = RPtests::sqrt_lasso(cbind(X.swap, Xk.swap), as.numeric(y), ...)
+  p = ncol(X)
+  orig = 1:p
+  W = pmax(Z[orig], Z[orig+p]) * sign(Z[orig] - Z[orig+p])
+  
+  # Correct for swapping of columns of X and Xk
+  W = W * (1-2*swap)
+}
+
+
+================================================
+FILE: R/knockoff/R/stats_stability_selection.R
+================================================
+#' Importance statistics based on stability selection
+#' 
+#' Computes the difference statistic
+#'   \deqn{W_j = |Z_j| - |\tilde{Z}_j|}
+#' where \eqn{Z_j} and \eqn{\tilde{Z}_j} are measure the importance
+#' of the jth variable and its knockoff, respectively, based on the 
+#' stability of their selection upon subsampling of the data.
+#' 
+#' @param X n-by-p matrix of original variables.
+#' @param X_k n-by-p matrix of knockoff variables.
+#' @param y response vector (length n)
+#' @param fitfun fitfun a function that takes the arguments x, y as above, 
+#' and additionally the number of variables to include in each model q. 
+#' The function then needs to fit the model and to return a logical vector 
+#' that indicates which variable was selected (among the q selected variables).
+#' The name of the function should be prefixed by 'stabs::'.
+#' @param ... additional arguments specific to 'stabs' (see Details).
+#' @return A vector of statistics \eqn{W} of length p.
+#'   
+#' @details This function uses the \code{stabs} package to compute
+#' variable selection stability. The selection stability of the j-th 
+#' variable is defined as its probability of being selected upon random
+#' subsampling of the data. The default method for selecting variables 
+#' in each subsampled dataset is \code{\link[stabs]{lars.lasso}}.
+#' 
+#' For a complete list of the available additional arguments, see \code{\link[stabs]{stabsel}}. 
+#' 
+#' @family statistics
+#' 
+#' @examples
+#' set.seed(2022)
+#' p=50; n=50; k=15
+#' mu = rep(0,p); Sigma = diag(p)
+#' X = matrix(rnorm(n*p),n)
+#' nonzero = sample(p, k)
+#' beta = 3.5 * (1:p %in% nonzero)
+#' y = X %*% beta + rnorm(n)
+#' knockoffs = function(X) create.gaussian(X, mu, Sigma)
+#' 
+#' # Basic usage with default arguments
+#' result = knockoff.filter(X, y, knockoffs=knockoffs,
+#'                          statistic=stat.stability_selection)
+#' print(result$selected)
+#' 
+#' 
+#' @rdname stat.stability_selection
+#' @export
+stat.stability_selection <- function(X, X_k, y, fitfun = stabs::lars.lasso, ...) {
+  if (!requireNamespace('stabs', quietly=T))
+    stop('stabs is not installed', call.=F)
+  if (!is.vector(y)) {
+    stop('Knockoff statistic stat.stability_selection requires the input y to be a vector')
+  }
+  
+  # Randomly swap columns of X and Xk
+  swap = rbinom(ncol(X),1,0.5)
+  swap.M = matrix(swap,nrow=nrow(X),ncol=length(swap),byrow=TRUE)
+  X.swap  = X * (1-swap.M) + X_k * swap.M
+  Xk.swap = X * swap.M + X_k * (1-swap.M)
+  
+  # Compute statistics
+  Z = stability_selection_importance(cbind(X.swap, Xk.swap), y, fitfun=fitfun, ...)
+  p = ncol(X)
+  orig = 1:p
+  W = abs(Z[orig]) - abs(Z[orig+p])
+  
+  # Correct for swapping of columns of X and Xk
+  W = W * (1-2*swap)
+}
+
+#' Stability selection
+#' 
+#' Perform variable selection with stability selection
+#' 
+#' @param X matrix of predictors
+#' @param y response vector
+#' @return vector with jth component the selection probability of variable j
+#' 
+#' @keywords internal
+stability_selection_importance <- function(X, y, ...) {
+  X = scale(X)
+  
+  if (!methods::hasArg(cutoff) ) {
+    cutoff = 0.75
+  }
+  if (!methods::hasArg(PFER) ) {
+    PFER = 1
+  }
+  
+  stabFit = stabs::stabsel(X, y, cutoff=cutoff, PFER=PFER, ...)
+  rowMeans(unname(stabFit$phat))
+}
+
+
+
+================================================
+FILE: R/knockoff/R/util.R
+================================================
+# Fast versions of diag(d) %*% X and X %*% diag(d).
+`%diag*%` <- function(d, X) d * X
+`%*diag%` <- function(X, d) t(t(X) * d)
+
+# Efficient test for matrix positive-definiteness
+# 
+# Computes the smallest eigenvalue of a matrix A to verify whether
+# A is positive-definite
+#' @keywords internal
+is_posdef = function(A, tol=1e-9) {
+  p = nrow(matrix(A))
+  
+  if (p<500) {
+    lambda_min = min(eigen(A)$values)
+  }
+  else {
+    oldw <- getOption("warn")
+    options(warn = -1)
+    lambda_min = RSpectra::eigs(A, 1, which="SM", opts=list(retvec = FALSE, maxitr=100, tol))$values
+    options(warn = oldw)
+    if( length(lambda_min)==0 ) {
+      # RSpectra::eigs did not converge. Using eigen instead."
+      lambda_min = min(eigen(A)$values)
+    }
+  }
+  return (lambda_min>tol*10)
+}
+  
+# Reduced SVD with canonical sign choice.
+# 
+# Our convention is that the sign of each vector in U is chosen such that the
+# coefficient with the largest absolute value is positive.
+#' @keywords internal
+canonical_svd = function(X) {
+  X.svd = tryCatch({
+    svd(X)
+  }, warning = function(w){}, error = function(e) {
+      stop("SVD failed in the creation of fixed-design knockoffs. Try upgrading R to version >= 3.3.0")
+  }, finally = {})
+  
+  for (j in 1:min(dim(X))) {
+    i = which.max(abs(X.svd$u[,j]))
+    if (X.svd$u[i,j] < 0) {
+      X.svd$u[,j] = -X.svd$u[,j]
+      X.svd$v[,j] = -X.svd$v[,j]
+  }
+    }
+  return(X.svd)
+}
+
+# Scale the columns of a matrix to have unit norm.
+#' @keywords internal
+normc = function(X,center=T) {
+  X.centered = scale(X, center=center, scale=F)
+  X.scaled = scale(X.centered, center=F, scale=sqrt(colSums(X.centered^2)))
+  X.scaled[,] # No attributes
+}
+
+# Generate a random matrix with i.i.d. normal entries.
+#' @keywords internal
+rnorm_matrix = function(n, p, mean=0, sd=1) {
+  matrix(rnorm(n*p, mean, sd), nrow=n, ncol=p)
+}
+
+# Generate a random, sparse regression problem.
+#' @keywords internal
+random_problem = function(n, p, k=NULL, amplitude=3) {
+  if (is.null(k)) k = max(1, as.integer(p/5))
+  X = normc(rnorm_matrix(n, p))
+  nonzero = sample(p, k)
+  beta = amplitude * (1:p %in% nonzero)
+  y.sample <- function() X %*% beta + rnorm(n)
+  list(X = X, beta = beta, y = y.sample(), y.sample = y.sample)
+}
+
+# Evaluate an expression with the given random seed, then restore the old seed.
+#' @keywords internal
+with_seed = function(seed, expr) {
+  seed.old = if (exists('.Random.seed')) .Random.seed else NULL
+  set.seed(seed)
+  on.exit({
+    if (is.null(seed.old)) {
+      if (exists('.Random.seed')) 
+        rm(.Random.seed, envir=.GlobalEnv)
+    } else {
+      .Random.seed <<- seed.old
+    }
+  })
+  expr
+}
+
