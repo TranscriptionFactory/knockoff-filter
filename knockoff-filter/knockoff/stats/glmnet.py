@@ -60,11 +60,14 @@ def _lasso_max_lambda_glmnet(
         lambdas = lambda_max * (lambda_min / lambda_max) ** k
 
         # Compute lasso path
+        # Note: sklearn removed fit_intercept from lasso_path; data should be centered
+        if intercept:
+            y = y - y.mean()
         try:
-            alphas, coefs, _ = lasso_path(X, y, alphas=lambdas, fit_intercept=intercept)
+            alphas, coefs, _ = lasso_path(X, y, alphas=lambdas)
         except Exception:
             # Fallback: let sklearn choose alphas
-            alphas, coefs, _ = lasso_path(X, y, n_alphas=nlambda, fit_intercept=intercept)
+            alphas, coefs, _ = lasso_path(X, y, n_alphas=nlambda)
 
         # coefs has shape (p, n_alphas)
         # Find first nonzero entry for each variable
