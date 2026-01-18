@@ -74,7 +74,7 @@ def _stability_selection(
                     n_jobs=1
                 )
             else:
-                model = LassoCV(cv=3, n_jobs=1)
+                model = LassoCV(cv=3, n_jobs=1, max_iter=10000)
 
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")

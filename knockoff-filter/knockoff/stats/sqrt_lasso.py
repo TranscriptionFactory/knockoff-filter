@@ -55,7 +55,7 @@ def _sqrt_lasso_path(
 
         # Use standard lasso as approximation
         # True sqrt-lasso would require custom solver
-        alphas, coefs, _ = lasso_path(X, y, alphas=lambdas, max_iter=1000)
+        alphas, coefs, _ = lasso_path(X, y, alphas=lambdas, max_iter=10000)
 
         # Find entry lambda for each variable
         lambda_entry = np.zeros(p)
@@ -75,7 +75,7 @@ def _sqrt_lasso_path(
         k = np.arange(nlambda) / nlambda
         lambdas = lambda_max * (lambda_min / lambda_max) ** k
 
-        alphas, coefs, _ = lasso_path(X, y, alphas=lambdas)
+        alphas, coefs, _ = lasso_path(X, y, alphas=lambdas, max_iter=10000)
 
         lambda_entry = np.zeros(p)
         for j in range(p):

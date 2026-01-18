@@ -168,7 +168,7 @@ def _cv_coeffs_glmnet(
         alphas = lambda_max * (lambda_min / lambda_max) ** k
 
         # Fit LassoCV
-        cv = LassoCV(alphas=alphas, fit_intercept=intercept, n_jobs=n_jobs, cv=10)
+        cv = LassoCV(alphas=alphas, fit_intercept=intercept, n_jobs=n_jobs, cv=10, max_iter=10000)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             cv.fit(X, y)
