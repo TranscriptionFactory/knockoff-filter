@@ -63,11 +63,13 @@ def _lasso_max_lambda_glmnet(
         # Note: sklearn removed fit_intercept from lasso_path; data should be centered
         if intercept:
             y = y - y.mean()
-        try:
-            alphas, coefs, _ = lasso_path(X, y, alphas=lambdas, max_iter=10000)
-        except Exception:
-            # Fallback: let sklearn choose alphas
-            alphas, coefs, _ = lasso_path(X, y, n_alphas=nlambda, max_iter=10000)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            try:
+                alphas, coefs, _ = lasso_path(X, y, alphas=lambdas, max_iter=10000)
+            except Exception:
+                # Fallback: let sklearn choose alphas
+                alphas, coefs, _ = lasso_path(X, y, n_alphas=nlambda, max_iter=10000)
 
         # coefs has shape (p, n_alphas)
         # Find first nonzero entry for each variable (vectorized)
