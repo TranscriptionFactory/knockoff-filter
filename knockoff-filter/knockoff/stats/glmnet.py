@@ -70,13 +70,12 @@ def _lasso_max_lambda_glmnet(
             alphas, coefs, _ = lasso_path(X, y, n_alphas=nlambda, max_iter=10000)
 
         # coefs has shape (p, n_alphas)
-        # Find first nonzero entry for each variable
-        lambda_entry = np.zeros(p)
-        for j in range(p):
-            nonzero_idx = np.where(np.abs(coefs[j, :]) > 0)[0]
-            if len(nonzero_idx) > 0:
-                # alphas are sorted in decreasing order by sklearn
-                lambda_entry[j] = alphas[nonzero_idx[0]] * n
+        # Find first nonzero entry for each variable (vectorized)
+        nonzero_mask = np.abs(coefs) > 0
+        first_nonzero_idx = nonzero_mask.argmax(axis=1)
+        has_nonzero = nonzero_mask.any(axis=1)
+        # alphas are sorted in decreasing order by sklearn
+        lambda_entry = np.where(has_nonzero, alphas[first_nonzero_idx] * n, 0.0)
 
         return lambda_entry
 
@@ -104,11 +103,10 @@ def _lasso_max_lambda_glmnet(
                     warnings.simplefilter("ignore")
                     clf.fit(X, y)
 
-                # Check which variables have entered
+                # Check which variables have entered (vectorized)
                 coefs = clf.coef_.ravel()
-                for j in range(p):
-                    if np.abs(coefs[j]) > 0 and lambda_entry[j] == 0:
-                        lambda_entry[j] = lambdas[i] * n
+                newly_entered = (np.abs(coefs) > 0) & (lambda_entry == 0)
+                lambda_entry[newly_entered] = lambdas[i] * n
 
             return lambda_entry
 

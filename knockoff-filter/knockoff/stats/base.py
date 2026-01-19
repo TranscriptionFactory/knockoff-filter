@@ -40,12 +40,10 @@ def swap_columns(
     # Generate random swap indicators
     swap = np.random.binomial(1, 0.5, p)
 
-    # Create swap matrix
-    swap_M = np.tile(swap, (n, 1))
-
-    # Perform swaps
-    X_swap = X * (1 - swap_M) + X_k * swap_M
-    Xk_swap = X * swap_M + X_k * (1 - swap_M)
+    # Perform swaps using broadcasting (swap shape (p,) broadcasts with (n, p))
+    swap_bool = swap.astype(bool)
+    X_swap = np.where(swap_bool, X_k, X)
+    Xk_swap = np.where(swap_bool, X, X_k)
 
     return X_swap, Xk_swap, swap
 
